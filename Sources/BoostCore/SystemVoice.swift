@@ -171,6 +171,25 @@ private final class PCMAdapter {
     }
 }
 
+/// Counts the buffers `AVSpeechSynthesizer.write` delivers (build 34 diagnostics: 0 buffers in a whole request has
+/// been the extension's story so far).
+private final class BufferCounter {
+    private let lock = NSLock()
+    private var count = 0
+    private var firstMs = -1
+
+    /// One more buffer; the count after it, and the time of the first one in ms since `since`.
+    func bump(since: Date) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        count += 1
+        if count == 1 { firstMs = Int(Date().timeIntervalSince(since) * 1000) }
+        return count
+    }
+
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    var first: Int { lock.lock(); defer { lock.unlock() }; return firstMs }
+}
+
 /// The Apple voices, through `AVSpeechSynthesizer.write` (iOS 13+): the PCM comes back to us instead of being played.
 ///
 /// `write`'s callbacks arrive on the MAIN queue (measured on macOS 27: with the main thread blocked they never come, from
@@ -240,22 +259,34 @@ public final class SystemVoice {
 
     /// Keeps an audio session active for `AVSpeechSynthesizer.write` (iOS 16: without one it may never call back,
     /// which is what a voice extension sees). macOS has no AVAudioSession.
+    /// Build 34: the category and the activation are tried apart, so the log says which one an extension is refused.
     @discardableResult
     public static func activateAudioSession() -> String {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers, .duckOthers])
+        } catch {
+            DiagnosticLog.write("audio session setCategory failed: \(status(of: error))")
+            return "failed"
+        }
+        do {
             try session.setActive(true)
             DiagnosticLog.write("audio session: category \(session.category.rawValue), sampleRate \(Int(session.sampleRate))")
             return "ok"
         } catch {
-            DiagnosticLog.write("audio session failed: \(error.localizedDescription)")
+            DiagnosticLog.write("audio session setActive failed: \(status(of: error))")
             return "failed"
         }
         #else
         return "not iOS"
         #endif
+    }
+
+    /// The OSStatus behind an audio session error, in the log's own words (its localized description alone hides it).
+    static func status(of error: Error) -> String {
+        let e = error as NSError
+        return "OSStatus \(e.code) \(e.domain) \(e.localizedDescription)"
     }
 
     /// The Apple voice behind `entry`, or the language's default Apple voice when that one is not installed. Never a
@@ -348,7 +379,16 @@ public final class SystemVoice {
         LatencyTrace.mark("write")
         #endif
         Thread.current.threadDictionary[SystemVoice.handingOverKey] = true
+        // Build 34: how many buffers `write` actually delivers, and when the first one comes (0 buffers is what an
+        // extension has shown so far: "first audio after none"), so a silent run says whether the callbacks are lost
+        // or the conversion drops them.
+        let w0 = Date()
+        let counter = BufferCounter()
         synth.write(u) { buffer in
+            let count = counter.bump(since: w0)
+            if count == 1 {
+                DiagnosticLog.write("write: first buffer after \(counter.first) ms, on \(Thread.isMainThread ? "main" : "background") thread")
+            }
             guard let pcm = buffer as? AVAudioPCMBuffer else { return }
             if pcm.frameLength == 0 { // the end of one voice's stretch (or of everything)
                 box.push(adapter.finish())
@@ -406,6 +446,9 @@ public final class SystemVoice {
             }
             if quiet > stallTimeout || (quiet > SystemVoice.soundStall && box.hasSound) {
                 if watch { SystemVoice.reportSlowEnd(box, since: t0, lag: lag, how: "stalled") }
+                if counter.value == 0 {
+                    DiagnosticLog.write("write gave nothing: 0 buffers in \(Int(Date().timeIntervalSince(w0) * 1000)) ms, synthesizer isSpeaking \(synth.isSpeaking), voice \(voices.first ?? "-")")
+                }
                 box.abandon()
                 synth.stopSpeaking(at: .immediate)
                 // a synthesizer that went quiet may stay stuck (every later request would wait it out too): a new one next

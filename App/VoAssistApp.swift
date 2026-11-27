@@ -237,6 +237,13 @@ struct ContentView: View {
             Button("清空日志") {
                 model.clearDiagnostics { ok in show(ok ? "日志已清空。" : "没能清空日志，请稍后再试。") }
             }
+            Button("检查语音扩展（自检）") {
+                guard let s = model.schemes.first(where: { $0.language == "zh-CN" }) ?? model.schemes.first else { return }
+                model.probeExtension(text: "你好，这是一次自检。", scheme: s)
+            }
+            if !model.probeStatus.isEmpty {
+                Text(model.probeStatus).font(.footnote)
+            }
         } header: {
             Text("日志")
         }
