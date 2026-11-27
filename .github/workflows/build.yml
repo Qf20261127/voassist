@@ -19,6 +19,8 @@ jobs:
   ipa:
     needs: test
     runs-on: macos-15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -74,3 +76,11 @@ jobs:
         with:
           name: VoAssist-unsigned-ipa
           path: VoAssist.ipa
+
+      - name: 发布到 Release（便于直接下载）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: VoAssist ${{ github.run_number }}
+          body: 未签名 ipa，用 TrollStore 自签安装。
+          files: VoAssist.ipa
