@@ -6,3 +6,4 @@ samples/
 .DS_Store
 xcuserdata/
 CLAUDE.local.md
+_backup_*/
