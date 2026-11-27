@@ -85,7 +85,7 @@ struct DiagnosticFile: Transferable {
             let f = DateFormatter()
             f.locale = Locale(identifier: "en_US_POSIX")
             f.dateFormat = "yyyyMMdd-HHmm"
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("旁白助手日志-\(f.string(from: Date())).txt")
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("旁白 Pro 日志-\(f.string(from: Date())).txt")
             try Data(text.utf8).write(to: url, options: .atomic)
             return SentTransferredFile(url)
         }
@@ -354,13 +354,13 @@ final class AppModel: ObservableObject {
     }
 
     func exportFile(_ kind: ExportKind) -> ShareFile {
-        let name = kind == .rules ? "旁白助手规则" : (kind == .schemes ? "旁白助手方案" : "旁白助手方案和规则")
+        let name = kind == .rules ? "旁白 Pro 规则" : (kind == .schemes ? "旁白 Pro 方案" : "旁白 Pro 方案和规则")
         return ShareFile(text: exportText(kind), name: name)
     }
 
     /// Imports shared text; returns what happened, for the user.
     func importText(_ text: String) -> String {
-        guard let bundle = ShareBundle.parse(text) else { return "这不是旁白助手的方案或规则" }
+        guard let bundle = ShareBundle.parse(text) else { return "这不是旁白 Pro 的方案或规则" }
         let m = bundle.merged(into: schemes, rules: rules)
         setSchemes(m.schemes)
         rules = m.rules
@@ -415,7 +415,7 @@ final class AppModel: ObservableObject {
         let machine = withUnsafeBytes(of: &sys.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
         let device = UIDevice.current
         var lines = [
-            "旁白助手日志，导出于 \(f.string(from: Date()))",
+            "旁白 Pro 日志，导出于 \(f.string(from: Date()))",
             "App \(info?["CFBundleShortVersionString"] as? String ?? "-") (\(info?["CFBundleVersion"] as? String ?? "-"))；\(device.systemName) \(device.systemVersion)；\(device.model) \(machine)\(ProcessInfo.processInfo.isiOSAppOnMac ? "；Mac 上的 iPhone 版" : "")",
             "旁白：\(UIAccessibility.isVoiceOverRunning ? "开" : "关")；日志：\(settings.logUntil.map { isLogging() ? "记录到 \(f.string(from: $0))" : "已在 \(f.string(from: $0)) 停止" } ?? "未在记录")\(isLogging() && settings.logSpeech ? "，含朗读内容" : "")",
             "规则：\(rules.count) 条，启用 \(rules.filter(\.enabled).count) 条",

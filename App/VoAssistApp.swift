@@ -87,7 +87,7 @@ struct ContentView: View {
                 Section("使用方法") {
                     Text("""
                     1. 在上面建好方案：选主语音、副语音和语速加倍。
-                    2. 打开 设置 → 辅助功能 → 旁白 → 语音，在方案对应的语言里点开“旁白助手”，选择方案。
+                    2. 打开 设置 → 辅助功能 → 旁白 → 语音，在方案对应的语言里点开“旁白 Pro”，选择方案。
                     3. 旁白自己的语速滑块和转子照常用，管的是不加速时的快慢；加速在本 App 的方案里设置。
                     4. 新建或改名的方案最多要约 30 秒才会出现在系统列表里；一直不出现就重启一次手机。
                     """).font(.footnote)
@@ -111,7 +111,7 @@ struct ContentView: View {
                 }
                 #endif
             }
-            .navigationTitle("旁白助手")
+            .navigationTitle("旁白 Pro")
             .onReceive(Timer.publish(every: 20, on: .main, in: .common).autoconnect()) { now = $0 }
             .navigationDestination(isPresented: $showRules) { RulesView(model: model) }
         }
@@ -220,7 +220,7 @@ struct ContentView: View {
             Toggle("记录朗读内容", isOn: Binding(get: { model.isLogging(at: now) && model.settings.logSpeech },
                                            set: { model.settings.logSpeech = $0 }))
                 .disabled(!model.isLogging(at: now))
-            ShareLink(item: model.diagnosticFile(), preview: SharePreview("旁白助手日志")) {
+            ShareLink(item: model.diagnosticFile(), preview: SharePreview("旁白 Pro 日志")) {
                 Text("发送日志")
             }
             Button("清空日志") {

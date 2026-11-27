@@ -1,4 +1,4 @@
-# 旁白助手（VoAssist）修复版 — 构建说明
+# 旁白 Pro（VoAssist）修复版 — 构建说明
 
 ## 一、修了什么
 
@@ -24,7 +24,7 @@
 2. 把本目录内容推上去：
 
 ```bash
-cd 旁白助手-修复版
+cd 旁白 Pro-修复版
 git remote set-url origin https://github.com/<你的账号>/voassist-fix.git
 git add -A && git commit -m "fix: 音色标识层级降级，修复 iOS 16 上无声"
 git branch -M main
@@ -43,7 +43,7 @@ git push -u origin main
 3. 装完打开 App，先确认：
    - 方案列表里有"婷婷+Samantha"；
    - 点试听，能听到婷婷的声音。
-4. 再到 设置 → 辅助功能 → 朗读内容 → 声音 → 中文（普通话），把"旁白助手：婷婷+Samantha"选上。
+4. 再到 设置 → 辅助功能 → 朗读内容 → 声音 → 中文（普通话），把"旁白 Pro：婷婷+Samantha"选上。
 
 ## 四、为什么必须是 TrollStore
 

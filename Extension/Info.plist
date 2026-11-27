@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>旁白助手语音</string>
+	<string>旁白 Pro 语音</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -28,11 +28,11 @@
 			<array>
 				<dict>
 					<key>description</key>
-					<string>旁白助手 Speech Synthesizer</string>
+					<string>旁白 Pro Speech Synthesizer</string>
 					<key>manufacturer</key>
 					<string>Zdyi</string>
 					<key>name</key>
-					<string>旁白助手: 旁白助手</string>
+					<string>旁白 Pro: 旁白 Pro</string>
 					<key>sandboxSafe</key>
 					<true/>
 					<key>subtype</key>
