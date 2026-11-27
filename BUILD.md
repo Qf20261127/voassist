@@ -18,6 +18,8 @@
 
 ## 二、在 GitHub 上出 ipa（不需要 Mac）
 
+> 现状（2026-11-27 已完成）：仓库已建好 <https://github.com/Qf20261127/voassist>，代码已推送，Actions 第 3 次运行成功，ipa 已挂在 Release：<https://github.com/Qf20261127/voassist/releases/download/build-3/VoAssist.ipa>（1.59 MB）。下面的步骤留作以后重新出包用。
+
 1. 在 GitHub 新建一个**私有**仓库（例如 `voassist-fix`）。
 2. 把本目录内容推上去：
 
@@ -57,8 +59,18 @@ App 内 → 日志 → 导出，重点看：
 - `语音扩展的记录` 里这次是否出现了 **render / 合成** 记录（原日志只有 init，说明请求没进到合成）；
 - 试听时提示文字：`合成失败：noVoice` = 仍然取不到音色；`timedOut` = 引擎卡住；显示秒数但没声音 = 播放层问题。
 
-## 六、尚未验证的部分
+## 六、编译验证情况（2026-11-27 已跑通）
 
-2026-11-27 追加的音频会话修复**没有经过编译验证**（当前机器是 Windows，无 Xcode/iOS SDK）。已做的是代码级修改与 CI 配置；第一次跑 Actions 时若出现编译错误，把日志贴回来即可修。
+Actions 在 `macos-15` runner 上编译通过（run 3），第 6 处音频会话修复随代码一起编译，`swift test` 与 `xcodebuild -scheme VoAssist -sdk iphoneos -configuration Release` 均成功。
+
+构建过程中踩到并已修掉的两点：
+
+| 现象 | 处理 |
+|---|---|
+| `ldid -S` 在 runner 上直接 `ldid.cpp(852): _assert(): false` | workflow 改为先试 `ldid`，失败则回退 `codesign --force --sign - --entitlements <plist>` 做 ad-hoc 伪签名，两条路径都写入 entitlements |
+| Artifact 下载需要登录，本机网络不稳 | 构建成功后用 `softprops/action-gh-release` 自动挂到 Release，公开链接可直接下 |
+| 本地浅克隆推送报 `did not receive expected object` | 用 `git fetch --unshallow https://github.com/myjy/VoAssist.git` 补齐历史后推送正常 |
+
+ipa 实测校验：`Payload/VoAssist.app/VoAssist` 与 `PlugIns/VoAssistVoice.appex/VoAssistVoice` 两个二进制里都含 `com.apple.security.application-groups` 与 `group.com.zdyi.voassist`；扩展标识 `com.zdyi.voassist.voice`，AudioComponent 为 `ausp / VoAs / Zdyi`，MinimumOSVersion 16.0，版本 1.0.0 (31)。
 
 原作者署名与许可证：Apache-2.0，见 `LICENSE`。
