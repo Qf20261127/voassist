@@ -1,0 +1,104 @@
+diff --git a/App/AppModel.swift b/App/AppModel.swift
+index 61c3324..d840ca3 100644
+--- a/App/AppModel.swift
++++ b/App/AppModel.swift
+@@ -181,7 +181,7 @@ final class AppModel: ObservableObject {
+     /// app sees (a downloaded voice may hide its built-in twin, so a few can be missing for a moment).
+     var pickableVoices: [VoiceEntry] {
+         usableVoices.isEmpty
+-            ? systemVoices.filter { $0.identifier.contains(".super-compact.") }.map(AppModel.entry)
++            ? systemVoices.filter { VoiceEntry.isWrappable($0.identifier) }.map(AppModel.entry)
+             : usableVoices
+     }
+ 
+@@ -214,13 +214,23 @@ final class AppModel: ObservableObject {
+     /// until it has said).
+     func defaultSchemes() -> [VoiceScheme] {
+         guard !usableVoices.isEmpty else { return VoiceScheme.defaults }
+-        return VoiceScheme.defaults.filter { isInstalled($0.main) }.map { d in
++        // 写死的标识（super-compact）在某些系统上并不存在，换成这台设备实际有的那个（compact 等）
++        return VoiceScheme.defaults.compactMap { d in
++            guard let m = installedEntry(for: d.main) else { return nil }
+             var s = d
+-            if let o = d.secondary, !isInstalled(o) { s.secondary = nil }
++            s.main = m
++            if let o = d.secondary { s.secondary = installedEntry(for: o) }
+             return s
+         }
+     }
+ 
++    /// 这台设备上真正可用的那个音色：先精确标识，再同语言同名，最后同语言的第一个。
++    func installedEntry(for e: VoiceEntry) -> VoiceEntry? {
++        usableVoices.first { $0.id == e.id }
++            ?? usableVoices.first { $0.lang == e.lang && $0.name.hasPrefix(e.name) }
++            ?? usableVoices.first { $0.lang == e.lang && VoiceEntry.isWrappable($0.id) }
++    }
++
+     /// Default schemes the user deleted; "恢复默认方案" adds them back.
+     var missingDefaults: [VoiceScheme] {
+         defaultSchemes().filter { d in !schemes.contains { $0.id == d.id } }
+diff --git a/Sources/BoostCore/SharedSettings.swift b/Sources/BoostCore/SharedSettings.swift
+index 375744f..7f6d1ee 100644
+--- a/Sources/BoostCore/SharedSettings.swift
++++ b/Sources/BoostCore/SharedSettings.swift
+@@ -184,6 +184,21 @@ public struct VoiceEntry: Codable, Equatable, Hashable {
+         appleID.hasPrefix("com.apple.") && !appleID.contains(".speech.synthesis.voice.") // novelty voices (Bells, Bubbles ...)
+     }
+ 
++    /// The same voice under the other quality tiers: `super-compact` on some systems, `compact` on others (an iPhone
++    /// with only the compact Chinese voice has `com.apple.voice.compact.zh-CN.Tingting` and no super-compact one).
++    /// Looked up in order, so a hard-coded identifier still finds the voice the device actually has.
++    public func candidateIDs() -> [String] {
++        let tiers = ["super-compact", "compact", "premium", "enhanced"]
++        var result = [id]
++        for from in tiers where id.contains(".\(from).") {
++            for to in tiers where to != from {
++                let alt = id.replacingOccurrences(of: ".\(from).", with: ".\(to).")
++                if !result.contains(alt) { result.append(alt) }
++            }
++        }
++        return result
++    }
++
+     // The built-in ("super-compact") voices: the only kind the voice extension can use (see `UsableVoices`).
+     public static let tingting = VoiceEntry(id: "com.apple.voice.super-compact.zh-CN.Tingting", name: "婷婷", lang: "zh-CN")
+     public static let samantha = VoiceEntry(id: "com.apple.voice.super-compact.en-US.Samantha", name: "Samantha", lang: "en-US")
+diff --git a/Sources/BoostCore/SystemVoice.swift b/Sources/BoostCore/SystemVoice.swift
+index 1cf23a0..21f68cb 100644
+--- a/Sources/BoostCore/SystemVoice.swift
++++ b/Sources/BoostCore/SystemVoice.swift
+@@ -231,9 +231,31 @@ public final class SystemVoice {
+     /// third-party voice: that would be a provider again (this very extension, at worst).
+     public func resolve(_ entry: VoiceEntry) -> AVSpeechSynthesisVoice? {
+         if let v = cache[entry.id] { return v }
+-        var v = AVSpeechSynthesisVoice(identifier: entry.id)
+-        if v == nil || !VoiceEntry.isWrappable(v!.identifier) { v = AVSpeechSynthesisVoice(language: entry.lang) }
+-        guard let voice = v, VoiceEntry.isWrappable(voice.identifier) else { return nil }
++        var found: AVSpeechSynthesisVoice?
++        // 1. the identifier itself, then the same voice under the other quality tiers (super-compact / compact / ...).
++        for cid in entry.candidateIDs() {
++            if let v = AVSpeechSynthesisVoice(identifier: cid), VoiceEntry.isWrappable(v.identifier) {
++                found = v
++                break
++            }
++        }
++        // 2. the list the extension reported through `fullState`: the voices this sandbox really has.
++        //    (Read here, not cached: an extension may start before the shared container is first unlocked.)
++        if found == nil, let list = UsableVoices.load(),
++           let match = list.first(where: { $0.lang == entry.lang && VoiceEntry.isWrappable($0.id) }),
++           let v = AVSpeechSynthesisVoice(identifier: match.id), VoiceEntry.isWrappable(v.identifier) {
++            found = v
++        }
++        // 3. the language's default system voice.
++        if found == nil, let v = AVSpeechSynthesisVoice(language: entry.lang), VoiceEntry.isWrappable(v.identifier) {
++            found = v
++        }
++        if found == nil {
++            DiagnosticLog.write("voice lookup \(entry.id) [\(entry.lang)]: none of \(entry.candidateIDs().count) candidates, not in the reported list, no default")
++        } else {
++            DiagnosticLog.write("voice lookup \(entry.id) [\(entry.lang)] -> \(found!.identifier)")
++        }
++        guard let voice = found else { return nil }
+         cache[entry.id] = voice
+         return voice
+     }

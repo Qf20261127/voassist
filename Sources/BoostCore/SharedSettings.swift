@@ -184,6 +184,21 @@ public struct VoiceEntry: Codable, Equatable, Hashable {
         appleID.hasPrefix("com.apple.") && !appleID.contains(".speech.synthesis.voice.") // novelty voices (Bells, Bubbles ...)
     }
 
+    /// The same voice under the other quality tiers: `super-compact` on some systems, `compact` on others (an iPhone
+    /// with only the compact Chinese voice has `com.apple.voice.compact.zh-CN.Tingting` and no super-compact one).
+    /// Looked up in order, so a hard-coded identifier still finds the voice the device actually has.
+    public func candidateIDs() -> [String] {
+        let tiers = ["super-compact", "compact", "premium", "enhanced"]
+        var result = [id]
+        for from in tiers where id.contains(".\(from).") {
+            for to in tiers where to != from {
+                let alt = id.replacingOccurrences(of: ".\(from).", with: ".\(to).")
+                if !result.contains(alt) { result.append(alt) }
+            }
+        }
+        return result
+    }
+
     // The built-in ("super-compact") voices: the only kind the voice extension can use (see `UsableVoices`).
     public static let tingting = VoiceEntry(id: "com.apple.voice.super-compact.zh-CN.Tingting", name: "婷婷", lang: "zh-CN")
     public static let samantha = VoiceEntry(id: "com.apple.voice.super-compact.en-US.Samantha", name: "Samantha", lang: "en-US")

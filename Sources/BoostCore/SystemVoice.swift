@@ -222,18 +222,66 @@ public final class SystemVoice {
     private var synthesizer: AVSpeechSynthesizer {
         if let s = synth { return s }
         let s = AVSpeechSynthesizer()
+        #if os(iOS)
+        // iOS 16 的 `write` 依赖一个活动的音频会话：App 进程里设过，语音扩展进程里默认没有，
+        // 结果是一次回调都不来（扩展日志里 first audio after none / 0 samples）。
+        s.usesApplicationAudioSession = true
+        SystemVoice.activateAudioSession()
+        #endif
         s.delegate = router
         synth = s
         return s
+    }
+
+    /// Keeps an audio session active for `AVSpeechSynthesizer.write` (iOS 16: without one it may never call back,
+    /// which is what a voice extension sees). macOS has no AVAudioSession.
+    @discardableResult
+    public static func activateAudioSession() -> String {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers, .duckOthers])
+            try session.setActive(true)
+            DiagnosticLog.write("audio session: category \(session.category.rawValue), sampleRate \(Int(session.sampleRate))")
+            return "ok"
+        } catch {
+            DiagnosticLog.write("audio session failed: \(error.localizedDescription)")
+            return "failed"
+        }
+        #else
+        return "not iOS"
+        #endif
     }
 
     /// The Apple voice behind `entry`, or the language's default Apple voice when that one is not installed. Never a
     /// third-party voice: that would be a provider again (this very extension, at worst).
     public func resolve(_ entry: VoiceEntry) -> AVSpeechSynthesisVoice? {
         if let v = cache[entry.id] { return v }
-        var v = AVSpeechSynthesisVoice(identifier: entry.id)
-        if v == nil || !VoiceEntry.isWrappable(v!.identifier) { v = AVSpeechSynthesisVoice(language: entry.lang) }
-        guard let voice = v, VoiceEntry.isWrappable(voice.identifier) else { return nil }
+        var found: AVSpeechSynthesisVoice?
+        // 1. the identifier itself, then the same voice under the other quality tiers (super-compact / compact / ...).
+        for cid in entry.candidateIDs() {
+            if let v = AVSpeechSynthesisVoice(identifier: cid), VoiceEntry.isWrappable(v.identifier) {
+                found = v
+                break
+            }
+        }
+        // 2. the list the extension reported through `fullState`: the voices this sandbox really has.
+        //    (Read here, not cached: an extension may start before the shared container is first unlocked.)
+        if found == nil, let list = UsableVoices.load(),
+           let match = list.first(where: { $0.lang == entry.lang && VoiceEntry.isWrappable($0.id) }),
+           let v = AVSpeechSynthesisVoice(identifier: match.id), VoiceEntry.isWrappable(v.identifier) {
+            found = v
+        }
+        // 3. the language's default system voice.
+        if found == nil, let v = AVSpeechSynthesisVoice(language: entry.lang), VoiceEntry.isWrappable(v.identifier) {
+            found = v
+        }
+        if found == nil {
+            DiagnosticLog.write("voice lookup \(entry.id) [\(entry.lang)]: none of \(entry.candidateIDs().count) candidates, not in the reported list, no default")
+        } else {
+            DiagnosticLog.write("voice lookup \(entry.id) [\(entry.lang)] -> \(found!.identifier)")
+        }
+        guard let voice = found else { return nil }
         cache[entry.id] = voice
         return voice
     }
@@ -281,6 +329,9 @@ public final class SystemVoice {
         u.volume = 1
         u.preUtteranceDelay = 0
         u.postUtteranceDelay = 0
+        #if os(iOS)
+        SystemVoice.activateAudioSession()
+        #endif
         let box = ChunkBox()
         let adapter = PCMAdapter(sampleRate: SystemVoice.sampleRate)
         let synth = synthesizer

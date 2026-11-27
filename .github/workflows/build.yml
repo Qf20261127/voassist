@@ -1,0 +1,67 @@
+name: build-ipa
+
+# 手动触发：仓库 → Actions → build-ipa → Run workflow
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+      - "*.md"
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 单元测试（BoostCore，不依赖 iOS SDK）
+        run: swift test
+        continue-on-error: true
+
+  ipa:
+    needs: test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具
+        run: brew install xcodegen ldid
+
+      - name: 生成 Xcode 工程
+        run: xcodegen generate
+
+      - name: 编译（不签名）
+        run: |
+          xcodebuild \
+            -project VoAssist.xcodeproj \
+            -scheme VoAssist \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+      - name: 组装 Payload 并伪签名
+        run: |
+          set -e
+          APP="build/Build/Products/Release-iphoneos/VoAssist.app"
+          test -d "$APP" || { echo "未找到 $APP"; ls build/Build/Products; exit 1; }
+          rm -rf Payload VoAssist.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          APPEX=$(ls -d Payload/VoAssist.app/PlugIns/*.appex | head -1)
+          APP_BIN="Payload/VoAssist.app/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' Payload/VoAssist.app/Info.plist)"
+          EXT_BIN="$APPEX/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APPEX/Info.plist")"
+          ldid -S App/VoAssist.entitlements "$APP_BIN"
+          ldid -S Extension/VoAssistVoice.entitlements "$EXT_BIN"
+          echo "--- 伪签名后的 entitlements ---"
+          ldid -e "$APP_BIN"
+          ldid -e "$EXT_BIN"
+          zip -qry VoAssist.ipa Payload
+          ls -lh VoAssist.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoAssist-unsigned-ipa
+          path: VoAssist.ipa

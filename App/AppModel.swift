@@ -181,7 +181,7 @@ final class AppModel: ObservableObject {
     /// app sees (a downloaded voice may hide its built-in twin, so a few can be missing for a moment).
     var pickableVoices: [VoiceEntry] {
         usableVoices.isEmpty
-            ? systemVoices.filter { $0.identifier.contains(".super-compact.") }.map(AppModel.entry)
+            ? systemVoices.filter { VoiceEntry.isWrappable($0.identifier) }.map(AppModel.entry)
             : usableVoices
     }
 
@@ -214,11 +214,21 @@ final class AppModel: ObservableObject {
     /// until it has said).
     func defaultSchemes() -> [VoiceScheme] {
         guard !usableVoices.isEmpty else { return VoiceScheme.defaults }
-        return VoiceScheme.defaults.filter { isInstalled($0.main) }.map { d in
+        // 写死的标识（super-compact）在某些系统上并不存在，换成这台设备实际有的那个（compact 等）
+        return VoiceScheme.defaults.compactMap { d in
+            guard let m = installedEntry(for: d.main) else { return nil }
             var s = d
-            if let o = d.secondary, !isInstalled(o) { s.secondary = nil }
+            s.main = m
+            if let o = d.secondary { s.secondary = installedEntry(for: o) }
             return s
         }
+    }
+
+    /// 这台设备上真正可用的那个音色：先精确标识，再同语言同名，最后同语言的第一个。
+    func installedEntry(for e: VoiceEntry) -> VoiceEntry? {
+        usableVoices.first { $0.id == e.id }
+            ?? usableVoices.first { $0.lang == e.lang && $0.name.hasPrefix(e.name) }
+            ?? usableVoices.first { $0.lang == e.lang && VoiceEntry.isWrappable($0.id) }
     }
 
     /// Default schemes the user deleted; "恢复默认方案" adds them back.
