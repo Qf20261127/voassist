@@ -53,11 +53,20 @@ jobs:
           APPEX=$(ls -d Payload/VoAssist.app/PlugIns/*.appex | head -1)
           APP_BIN="Payload/VoAssist.app/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' Payload/VoAssist.app/Info.plist)"
           EXT_BIN="$APPEX/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APPEX/Info.plist")"
-          ldid -S App/VoAssist.entitlements "$APP_BIN"
-          ldid -S Extension/VoAssistVoice.entitlements "$EXT_BIN"
+          sign_one() {
+            local bin="$1" ent="$2"
+            if ldid -S "$ent" "$bin" 2>/dev/null; then
+              echo "ldid ok: $bin"
+            else
+              echo "ldid 失败，回退 codesign: $bin"
+              codesign --force --sign - --entitlements "$ent" --timestamp=none "$bin"
+            fi
+          }
+          sign_one "$APP_BIN" App/VoAssist.entitlements
+          sign_one "$EXT_BIN" Extension/VoAssistVoice.entitlements
           echo "--- 伪签名后的 entitlements ---"
-          ldid -e "$APP_BIN"
-          ldid -e "$EXT_BIN"
+          codesign -d --entitlements :- "$APP_BIN" 2>&1 | tail -n +2 || true
+          codesign -d --entitlements :- "$EXT_BIN" 2>&1 | tail -n +2 || true
           zip -qry VoAssist.ipa Payload
           ls -lh VoAssist.ipa
 
