@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - name: 单元测试（BoostCore，不依赖 iOS SDK）
@@ -18,7 +18,7 @@ jobs:
 
   ipa:
     needs: test
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: write
     steps:
