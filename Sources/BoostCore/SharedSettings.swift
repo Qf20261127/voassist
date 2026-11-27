@@ -109,8 +109,14 @@ public struct BoostSettings: Codable, Equatable {
     /// made only as playback needs it: after full stops (cut after commas too, the reading sounded like sentences
     /// ending there). `-cutAt` and the debug section of the app switch it for development.
     public var cutAt = PieceCut.sentence
+    /// Troubleshooting (build 33): how `AVSpeechSynthesizer` in the voice extension handles the audio session. In an
+    /// extension every `AVAudioSession.setActive` fails (OSStatus 4099), while `usesApplicationAudioSession = true`
+    /// makes `write` depend on that session, so no buffer ever comes back (the log's "first audio after none" /
+    /// "0 samples"). 0 = application session and activate it (build 32 and before), 1 = no application session, do
+    /// not activate, 2 = application session but no activate, 3 = no application session, activate anyway.
+    public var audioSessionMode = 1
 
-    enum CodingKeys: String, CodingKey { case rateMap, logUntil, logSpeech, allAtOnce, cutAt }
+    enum CodingKeys: String, CodingKey { case rateMap, logUntil, logSpeech, allAtOnce, cutAt, audioSessionMode }
 
     public init() {}
 
@@ -121,6 +127,7 @@ public struct BoostSettings: Codable, Equatable {
         logSpeech = (try? c.decodeIfPresent(Bool.self, forKey: .logSpeech)) ?? false
         allAtOnce = (try? c.decodeIfPresent(Bool.self, forKey: .allAtOnce)) ?? false
         cutAt = (try? c.decodeIfPresent(PieceCut.self, forKey: .cutAt)) ?? .sentence
+        audioSessionMode = (try? c.decodeIfPresent(Int.self, forKey: .audioSessionMode)) ?? 1
     }
 
     /// Whether the diagnostic log is being recorded at `now`.

@@ -225,8 +225,13 @@ public final class SystemVoice {
         #if os(iOS)
         // iOS 16 的 `write` 依赖一个活动的音频会话：App 进程里设过，语音扩展进程里默认没有，
         // 结果是一次回调都不来（扩展日志里 first audio after none / 0 samples）。
-        s.usesApplicationAudioSession = true
-        SystemVoice.activateAudioSession()
+        // 但在扩展进程里 `AVAudioSession.setActive` 一律失败（OSStatus 4099，build 32 的日志），
+        // 而 `usesApplicationAudioSession = true` 又让 `write` 依赖这个不存在的会话。build 33 起按
+        // `BoostSettings.audioSessionMode` 选组合，默认不用应用会话、也不激活（mode 1）。
+        let mode = BoostSettings.shared().audioSessionMode
+        s.usesApplicationAudioSession = (mode == 0 || mode == 2)
+        DiagnosticLog.write("audio session mode \(mode), usesApplicationAudioSession \(s.usesApplicationAudioSession)")
+        if mode == 0 || mode == 3 { SystemVoice.activateAudioSession() }
         #endif
         s.delegate = router
         synth = s
@@ -330,7 +335,8 @@ public final class SystemVoice {
         u.preUtteranceDelay = 0
         u.postUtteranceDelay = 0
         #if os(iOS)
-        SystemVoice.activateAudioSession()
+        let mode = BoostSettings.shared().audioSessionMode
+        if mode == 0 || mode == 3 { SystemVoice.activateAudioSession() }
         #endif
         let box = ChunkBox()
         let adapter = PCMAdapter(sampleRate: SystemVoice.sampleRate)

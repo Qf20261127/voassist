@@ -1,0 +1,18 @@
+旁白 Pro（VoAssist）更新日志
+==================================================
+
+v1.0.0 build 32（2026-11-27）
+- 应用显示名：旁白助手 → 旁白 Pro（桌面图标）
+- 系统语音列表显示名：旁白助手语音 → 旁白 Pro 语音
+- 语音组件注册名：旁白助手: 旁白助手 → 旁白 Pro: 旁白 Pro
+- 方案文件类型名称：旁白助手方案 → 旁白 Pro 方案（扩展名 .voassist 不变）
+- App 内导航标题、分享文案、导出日志文件名统一为「旁白 Pro」
+- Bundle ID 未变（com.zdyi.voassist / com.zdyi.voassist.voice），可覆盖安装
+
+v1.0.0 build 31（2026-11-27，诊断日志实测）
+- 音色标识层级降级已生效：super-compact.zh-CN.Tingting → compact.zh-CN.Tingting 命中成功
+- 遗留问题（未解决）：音频会话激活全部失败 OSStatus 4099，116 次 playback 均为 0 samples，仍然无声
+- 下一步待试：去掉手动 activateAudioSession()，会话交给合成器自建
+
+v1.0.0 build 30（2026-11-27 之前）
+- 音色标识写死 super-compact，iPhone 上只有 compact，取不到音色 → 静默无声

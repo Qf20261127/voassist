@@ -1,6 +1,14 @@
 旁白 Pro（VoAssist）更新日志
 ==================================================
 
+v1.0.0 build 33（2026-11-27）
+- 修无声：语音扩展进程里 AVAudioSession 激活一律失败（OSStatus 4099），而合成器又被设成「使用应用会话」，
+  于是 write 一次回调都不来（日志里 first audio after none、0 samples）
+- 默认改为「不用应用会话、不激活」，把会话交给合成器自建
+- App 新增「合成音频会话（排错用）」开关，可切 4 种组合对照（0 应用会话+激活 / 1 都不用 / 2 应用会话不激活 / 3 不用会话仍激活）
+- 扩展日志每次建合成器时记一行「audio session mode N, usesApplicationAudioSession true|false」
+- 未变：组件 subtype VoAs、Bundle ID、方案文件格式；显示名仍为旁白 Pro
+
 v1.0.0 build 32（2026-11-27）
 - 应用显示名：旁白助手 → 旁白 Pro（桌面图标）
 - 系统语音列表显示名：旁白助手语音 → 旁白 Pro 语音

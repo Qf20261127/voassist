@@ -95,6 +95,17 @@ struct ContentView: View {
 
                 logSection
 
+                Section("合成音频会话（排错用）") {
+                    Picker("会话方式", selection: $model.settings.audioSessionMode) {
+                        Text("不用应用会话、不激活").tag(1)
+                        Text("应用会话、激活（build 32）").tag(0)
+                        Text("应用会话、不激活").tag(2)
+                        Text("不用应用会话、仍激活").tag(3)
+                    }
+                    Text("扩展日志里每次合成前会记一行“audio session mode N”。切换后要重启一次手机，扩展才用新组合。")
+                        .font(.footnote)
+                }
+
                 Section("关于") {
                     NavigationLink("开源许可") { LicenseView() }
                 }
