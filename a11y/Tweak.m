@@ -55,28 +55,43 @@ static BOOL InSettingsArea(UIView *v) {
     return NO;
 }
 
+static BOOL HasLatinLetter(NSString *s) {
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return YES;
+    }
+    return NO;
+}
+
+// 规则：中英混排只留中文段（「顶部 (Top)」→「顶部」）；纯英文多词整行丢弃（分组标题、页脚说明）；
+// 纯英文单词保留（拨号键上的 ABC、DEF 不能被清掉）；纯数字/符号串保留。
 static NSString *FilterEnglish(NSString *raw) {
     if (![raw isKindOfClass:[NSString class]] || raw.length == 0) return raw;
-    static NSCharacterSet *seps = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        seps = [NSCharacterSet characterSetWithCharactersInString:@"/|.\n\r()"];
-    });
-    NSArray *parts = [raw componentsSeparatedByCharactersInSet:seps];
-    if (parts.count < 2) {
-        if (HasNonASCII(raw) || IsCodeLike(raw)) return raw;
-        return @"";
-    }
-    NSMutableArray *keep = [NSMutableArray array];
-    for (NSString *p in parts) {
-        if (HasNonASCII(p) || IsCodeLike(p)) {
-            NSString *t = TrimStr(p);
-            if (t.length) [keep addObject:t];
+    if (!HasLatinLetter(raw)) return raw;
+
+    if (HasNonASCII(raw)) {
+        static NSCharacterSet *seps = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            seps = [NSCharacterSet characterSetWithCharactersInString:@"/|.\n\r()（）"];
+        });
+        NSArray *parts = [raw componentsSeparatedByCharactersInSet:seps];
+        NSMutableArray *keep = [NSMutableArray array];
+        for (NSString *p in parts) {
+            if (!HasLatinLetter(p)) {
+                NSString *t = TrimStr(p);
+                if (t.length) [keep addObject:t];
+            }
         }
+        if (keep.count == 0) return @"";
+        return TrimStr([keep componentsJoinedByString:@" "]);
     }
-    if (keep.count == parts.count) return raw;
-    if (keep.count == 0) return @"";
-    return TrimStr([keep componentsJoinedByString:@" "]);
+
+    // 纯英文：两个词以上视为说明/标题整行丢弃
+    NSArray *words = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSUInteger real = 0;
+    for (NSString *w in words) if (TrimStr(w).length) real++;
+    return real >= 2 ? @"" : raw;
 }
 
 static NSMutableArray *gQueue = nil;
@@ -581,11 +596,18 @@ static IMP gOrigSetText = NULL;
 static IMP gOrigSetAttrText = NULL;
 static IMP gOrigTFSetText = NULL;
 
+// 只认号码输入框本身。原生下方那排「会员 235 号…」是 UILabel，它的文字被当成输入过几次，
+// 导致删除时号码取错、候选反复刷新，这里直接不再采信 UILabel。
 static void TrackDial(id self, NSString *text) {
-    if (!LooksLikeDial(text) || text.length == 0) return;
+    if (![self isKindOfClass:[UITextField class]]) return;
+    if (!LooksLikeDial(text) || text.length == 0) {
+        gLastDial = @"";
+        RefreshBarFor(@"");
+        return;
+    }
     gLastDial = text;
-    if ([self isKindOfClass:[UITextField class]]) gDialField = (UITextField *)self;
-    A11yLog(@"拨号文本：%@（字段=%@）", text, [self isKindOfClass:[UITextField class]] ? @"UITextField" : NSStringFromClass([self class]));
+    gDialField = (UITextField *)self;
+    A11yLog(@"拨号文本：%@", text);
     RefreshBarFor(text);
 }
 
@@ -595,8 +617,12 @@ static void HookSetText(id self, SEL cmd, NSString *text) {
     NSString *t = text;
     if ([t isKindOfClass:[NSString class]]) {
         TrackDial(self, t);
-        if ([self isKindOfClass:[UIView class]] && InSettingsArea((UIView *)self)) {
-            t = FilterEnglish(t);
+        if ([self isKindOfClass:[UILabel class]]) {
+            NSString *f = FilterEnglish(t);
+            if (f && ![f isEqualToString:t]) {
+                A11yLog(@"英文清理：%@ -> %@", t, f);
+                t = f;
+            }
         }
     }
     ((void (*)(id, SEL, NSString *))gOrigSetText)(self, cmd, t);
@@ -604,11 +630,11 @@ static void HookSetText(id self, SEL cmd, NSString *text) {
 
 static void HookSetAttrText(id self, SEL cmd, NSAttributedString *text) {
     NSAttributedString *t = text;
-    if ([t isKindOfClass:[NSAttributedString class]] && [self isKindOfClass:[UIView class]]
-        && InSettingsArea((UIView *)self)) {
+    if ([t isKindOfClass:[NSAttributedString class]] && [self isKindOfClass:[UILabel class]]) {
         NSString *s = t.string;
         NSString *f = FilterEnglish(s);
         if (f && ![f isEqualToString:s]) {
+            A11yLog(@"英文清理(富文本)：%@ -> %@", s, f);
             NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
             ps.lineBreakMode = NSLineBreakByTruncatingTail;
             t = [[NSAttributedString alloc] initWithString:f
@@ -648,15 +674,23 @@ static void InstallTextHook(Class cls, IMP *slot, IMP hook, const char *selName)
 }
 
 - (void)tap:(UITapGestureRecognizer *)g {
-    NSString *cur = gLastDial;
-    if (cur.length > 0) {
-        NSString *after = [cur substringToIndex:cur.length - 1];
-        gLastDial = after;
-        if (after.length == 0) EnqueueAnnounce(@"号码已清空");
-        else EnqueueAnnounce([NSString stringWithFormat:@"已删除，当前 %@", after]);
-    } else {
-        EnqueueAnnounce(@"删除");
+    UITextField *f = gDialField;
+    NSString *cur = f.text.length ? f.text : gLastDial;
+    cur = cur ?: @"";
+    if (cur.length == 0) {
+        EnqueueAnnounce(@"号码已空");
+        A11yLog(@"删除键命中，当前已空");
+        return;
     }
+    NSString *after = [cur substringToIndex:cur.length - 1];
+    if (f) {
+        f.text = after;
+        [f sendActionsForControlEvents:UIControlEventEditingChanged];
+    }
+    gLastDial = after;
+    if (after.length == 0) EnqueueAnnounce(@"号码已清空");
+    else EnqueueAnnounce([NSString stringWithFormat:@"已删除，当前 %@", after]);
+    A11yLog(@"删除键命中，剩 %@", after);
 }
 
 - (void)longPress:(UILongPressGestureRecognizer *)g {
@@ -694,11 +728,43 @@ static NSUInteger CountDialKeys(UIView *root, NSUInteger limit, int depth) {
     return n;
 }
 
+// 拨号键是 TPDialerNumberPad 里自绘的，label.text 往往为空，靠数字 label 计数会永远为 0。
+// 改为：类名带 NumberPad / KeyPad，或页面上有 ≥8 个 60~120pt 的方形可交互控件。
+static NSUInteger CountSquareControls(UIView *root, NSUInteger limit, int depth) {
+    if (!root || depth > 14 || limit == 0) return 0;
+    NSUInteger n = 0;
+    if ([root isKindOfClass:[UIControl class]]) {
+        CGSize s = root.bounds.size;
+        if (s.width >= 60 && s.width <= 120 && s.height >= 60 && s.height <= 120) n++;
+    }
+    for (UIView *sub in root.subviews) {
+        n += CountSquareControls(sub, limit - n, depth + 1);
+        if (n >= limit) return n;
+    }
+    return n;
+}
+
+static BOOL HasClassFrag(UIView *root, NSString *frag, int depth) {
+    if (!root || depth > 14) return NO;
+    if ([NSStringFromClass([root class]) rangeOfString:frag options:NSCaseInsensitiveSearch].location != NSNotFound)
+        return YES;
+    for (UIView *sub in root.subviews) {
+        if (HasClassFrag(sub, frag, depth + 1)) return YES;
+    }
+    return NO;
+}
+
 static BOOL LooksLikeDialPad(UIWindow *win) {
-    return win && CountDialKeys(win, 8, 0) >= 8;
+    if (!win) return NO;
+    if (HasClassFrag(win, @"NumberPad", 0) || HasClassFrag(win, @"KeyPad", 0)) return YES;
+    return CountSquareControls(win, 8, 0) >= 8;
 }
 
 static BOOL LooksLikeDeleteControl(UIView *v) {
+    NSString *cls = NSStringFromClass([v class]);
+    if ([cls rangeOfString:@"Delete" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+        [cls rangeOfString:@"Backspace" options:NSCaseInsensitiveSearch].location != NSNotFound)
+        return YES;
     NSString *label = [v accessibilityLabel];
     if (label && [label rangeOfString:@"删除"].location != NSNotFound) return YES;
     NSString *ident = [v accessibilityIdentifier];
@@ -745,13 +811,13 @@ static void ConfigureDeleteControl(UIView *v) {
     v.accessibilityTraits = UIAccessibilityTraitButton | UIAccessibilityTraitAllowsDirectInteraction;
 
     UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:[A11yDel shared] action:@selector(tap:)];
-    t.cancelsTouchesInView = NO;
+    t.cancelsTouchesInView = YES;   // 由我们独占处理，避免原生按钮再删一次造成双删
     [v addGestureRecognizer:t];
 
     UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
         initWithTarget:[A11yDel shared] action:@selector(longPress:)];
     lp.minimumPressDuration = 0.7;
-    lp.cancelsTouchesInView = NO;
+    lp.cancelsTouchesInView = YES;
     [v addGestureRecognizer:lp];
 }
 
@@ -978,10 +1044,19 @@ static void RefreshBarFor(NSString *typed) {
         UIWindow *win = KeyWindowNow();
         if (!win) return;
 
+        // 候选条贴在号码输入区正下方（和原生那行「会员 235 号…」同一块区域），不再沉到底部
+        CGFloat h = 44;
+        CGFloat y = win.bounds.size.height - 320;
+        if (gDialField) {
+            UIView *box = gDialField.superview ? gDialField.superview : gDialField;
+            CGRect r = [box convertRect:box.bounds toView:win];
+            if (r.size.height > 0 && r.size.height < 400)
+                y = CGRectGetMaxY(r) + 4;
+        }
+        CGRect barFrame = CGRectMake(8, y, win.bounds.size.width - 16, h);
+
         if (!gBar) {
-            CGFloat h = 48;
-            CGFloat y = win.bounds.size.height - 320;
-            gBar = [[UIView alloc] initWithFrame:CGRectMake(8, y, win.bounds.size.width - 16, h)];
+            gBar = [[UIView alloc] initWithFrame:barFrame];
             gBar.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.96];
             gBar.layer.cornerRadius = 10;
             gBar.layer.borderWidth = 0.5;
@@ -1023,6 +1098,7 @@ static void RefreshBarFor(NSString *typed) {
         }
         gBarStack.frame = CGRectMake(0, 0, MAX(cursorX, gBarScroll.bounds.size.width), 44);
         gBarScroll.contentSize = gBarStack.frame.size;
+        gBar.frame = barFrame;   // 输入区位置变了就跟着走
     });
 }
 
