@@ -866,6 +866,218 @@ static void WriteDialAll(NSString *text) {
     if (gDialField) [gDialField sendActionsForControlEvents:UIControlEventEditingChanged];
 }
 
+// ============ v10 拨号记账 ============
+// 为什么不继续用 setText 钩子：真机日志里 App 拨号全程没有一次 setText，钩子根本没被调用，
+// 拦截和候选条自然全是死代码。改成从「用户按了哪个键」这条最确定的线索自己记账。
+static BOOL HasClassFrag(UIView *root, NSString *frag, int depth);
+static UIWindow *KeyWindowNow(void);
+
+static void CollectDialFields(UIView *v, int depth, NSMutableArray *out) {
+    if (!v || depth > 16) return;
+    if ([v isKindOfClass:[UITextField class]] && InDialerArea(v)) [out addObject:v];
+    for (UIView *s in v.subviews) CollectDialFields(s, depth + 1, out);
+}
+
+// 显示层可能是 UITextField，也可能是自绘 UIView 里的 UILabel，两个都认
+static UITextField *DialDisplayField(void) {
+    NSMutableArray *a = [NSMutableArray array];
+    for (UIWindow *w in [UIApplication sharedApplication].windows) CollectDialFields(w, 0, a);
+    UITextField *best = nil;
+    NSUInteger bestLen = 0;
+    for (UITextField *f in a) {
+        NSUInteger n = DigitsOnly(f.text ? f.text : @"").length;
+        if (!best || n > bestLen) { best = f; bestLen = n; }
+    }
+    if (!best && a.count) best = a.firstObject;
+    return best;
+}
+
+static BOOL LabelLooksLikeNumber(UILabel *l) {
+    NSString *t = l.text;
+    if (t.length == 0 || t.length > 24) return YES;      // 空 label 可能是显示层
+    NSCharacterSet *ok = [NSCharacterSet characterSetWithCharactersInString:@"0123456789+*# -()"];
+    return [[t stringByTrimmingCharactersInSet:ok] length] == 0;
+}
+
+static NSString *ReadDialDigits(void);
+
+// 写显示层：UITextField 和「看着像号码」的 UILabel 一起写
+static void WriteDialV10(UIView *root, NSString *text, int depth) {
+    if (!root || depth > 16) return;
+    if ([root isKindOfClass:[UITextField class]] && InDialerArea(root)) {
+        ((void (*)(id, SEL, NSString *))gOrigTFSetText)((id)root, @selector(setText:), text);
+    } else if ([root isKindOfClass:[UILabel class]] && InDialerArea(root)) {
+        UILabel *l = (UILabel *)root;
+        NSString *cur = l.text ? l.text : @"";
+        if ([cur length] && ![LabelLooksLikeNumber(l)]) {
+            // 不是号码样子的 label（比如「会员 235 号…下一行」）不动
+        } else {
+            ((void (*)(id, SEL, NSString *))gOrigSetText)((id)root, @selector(setText:), text);
+        }
+    }
+    for (UIView *s in root.subviews) WriteDialV10(s, text, depth + 1);
+}
+
+static void WriteDialAllV10(NSString *text) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) WriteDialV10(w, text, 0);
+    UITextField *f = DialDisplayField();
+    if (f) [f sendActionsForControlEvents:UIControlEventEditingChanged];
+}
+
+static NSString *ReadDialDigits(void) {
+    UITextField *f = DialDisplayField();
+    return f ? DigitsOnly(f.text ? f.text : @"") : @"";
+}
+
+// 每 0.25 秒跑一次：显示层只要比用户实际敲的多，就截回用户敲的长度
+static void EnforceDialText(void) {
+    UIWindow *win = KeyWindowNow();
+    if (!win || !HasClassFrag(win, @"NumberPad", 0)) return;
+    UITextField *f = DialDisplayField();
+    if (!f) return;
+    gDialField = f;
+    NSString *disp = DigitsOnly(f.text ? f.text : @"");
+    if (!gUserTyped) gUserTyped = @"";
+    if (gUserTyped.length == 0) {
+        if (disp.length) { gUserTyped = disp; gLastDial = disp; RefreshBarFor(disp); }
+        return;
+    }
+    if (![disp isEqualToString:gUserTyped]) {
+        if (disp.length < gUserTyped.length) {
+            // 用户自己删掉了（原生路径），跟上
+            gUserTyped = disp;
+            gLastDial = disp;
+            RefreshBarFor(disp);
+        } else {
+            A11yLog(@"看门狗截回：显示 %@ -> 保留 %@", disp, gUserTyped);
+            WriteDialAllV10(gUserTyped);
+            RefreshBarFor(gUserTyped);
+        }
+    }
+}
+
+static char kPadDigit;
+static char kPadDone;
+static char kPadLast;
+
+@interface A11yPad : NSObject
+@end
+
+@implementation A11yPad
+
++ (instancetype)shared {
+    static A11yPad *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[A11yPad alloc] init]; });
+    return s;
+}
+
+// 一次按键只记一次：UIControl 目标和手势可能同时到达，0.2 秒内同一位数字去重
+- (void)press:(NSString *)d {
+    if (d.length != 1) return;
+    NSTimeInterval nowTs = [NSDate timeIntervalSinceReferenceDate];
+    NSString *last = objc_getAssociatedObject(self, &kPadLast);
+    if (last.length && nowTs - gLastAccept < 0.2 && [last isEqualToString:d]) {
+        gLastAccept = nowTs;
+        return;
+    }
+    objc_setAssociatedObject(self, &kPadLast, d, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    if (!gUserTyped) gUserTyped = @"";
+    NSString *next = [gUserTyped stringByAppendingString:d];
+    gUserTyped = next;
+    gLastDial = next;
+    gLastAccept = nowTs;
+    gDialField = DialDisplayField();
+    A11yLog(@"按键记账 %@ -> %@", d, next);
+    WriteDialAllV10(next);
+    RefreshBarFor(next);
+}
+
+- (void)hit:(UIControl *)c {
+    NSString *d = objc_getAssociatedObject(c, &kPadDigit);
+    [self press:d];
+}
+
+// 自绘按键收不到 UIControl 事件时的兜底：按落点算九宫格
+- (void)padTap:(UITapGestureRecognizer *)g {
+    UIView *pad = g.view;
+    if (!pad) return;
+    CGPoint p = [g locationInView:pad];
+    CGFloat W = pad.bounds.size.width, H = pad.bounds.size.height;
+    if (W <= 0 || H <= 0) return;
+    int col = (int)((p.x / W) * 3.0);
+    int row = (int)((p.y / H) * 4.0);
+    if (col < 0) col = 0; if (col > 2) col = 2;
+    if (row < 0) row = 0; if (row > 3) row = 3;
+    NSString *d;
+    if (row < 3) d = [NSString stringWithFormat:@"%d", row * 3 + col + 1];
+    else d = (col == 0 ? @"*" : (col == 1 ? @"0" : @"#"));
+    [self press:d];
+}
+@end
+
+static UIView *FindNumberPad(UIView *root, int depth) {
+    if (!root || depth > 14) return nil;
+    NSString *cn = NSStringFromClass([root class]);
+    if ([cn rangeOfString:@"NumberPad" options:NSCaseInsensitiveSearch].location != NSNotFound) return root;
+    for (UIView *s in root.subviews) {
+        UIView *p = FindNumberPad(s, depth + 1);
+        if (p) return p;
+    }
+    return nil;
+}
+
+static int AttachPadKeys(UIView *v, UIView *pad, int depth, int found) {
+    if (!v || depth > 12 || !pad) return found;
+    if ([v isKindOfClass:[UIControl class]] && v != pad) {
+        CGSize s = v.bounds.size;
+        if (s.width >= 55 && s.width <= 125 && s.height >= 55 && s.height <= 125 &&
+            !objc_getAssociatedObject(v, &kPadDone)) {
+            CGRect r = [v convertRect:v.bounds toView:pad];
+            CGFloat W = pad.bounds.size.width, H = pad.bounds.size.height;
+            if (W > 0 && H > 0) {
+                int col = (int)((CGRectGetMidX(r) / W) * 3.0);
+                int row = (int)((CGRectGetMidY(r) / H) * 4.0);
+                if (col < 0) col = 0; if (col > 2) col = 2;
+                if (row < 0) row = 0; if (row > 3) row = 3;
+                NSString *d = nil;
+                if (row < 3) d = [NSString stringWithFormat:@"%d", row * 3 + col + 1];
+                else d = (col == 0 ? @"*" : (col == 1 ? @"0" : @"#"));
+                objc_setAssociatedObject(v, &kPadDigit, d, OBJC_ASSOCIATION_COPY_NONATOMIC);
+                objc_setAssociatedObject(v, &kPadDone, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                [(UIControl *)v addTarget:[A11yPad shared] action:@selector(hit:)
+                           forControlEvents:UIControlEventTouchUpInside];
+                found++;
+            }
+        }
+    }
+    for (UIView *s in v.subviews) found = AttachPadKeys(s, pad, depth + 1, found);
+    return found;
+}
+
+static char kPadGesture;
+static void AttachPadTaps(void) {
+    UIWindow *win = KeyWindowNow();
+    if (!win) return;
+    UIView *pad = FindNumberPad(win, 0);
+    if (!pad) return;
+    if (!objc_getAssociatedObject(pad, &kPadGesture)) {
+        UITapGestureRecognizer *tg = [[UITapGestureRecognizer alloc] initWithTarget:[A11yPad shared]
+                                                                            action:@selector(padTap:)];
+        tg.cancelsTouchesInView = NO;
+        [pad addGestureRecognizer:tg];
+        objc_setAssociatedObject(pad, &kPadGesture, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        A11yLog(@"拨号盘手势兜底已挂上 %@", NSStringFromClass([pad class]));
+    }
+    static char kScanOnce;
+    if (!objc_getAssociatedObject(pad, &kScanOnce)) {
+        int n = AttachPadKeys(pad, pad, 0, 0);
+        A11yLog(@"拨号键接管数=%d", n);
+        if (n > 0) objc_setAssociatedObject(pad, &kScanOnce, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+// ============ v10 结束 ============
+
 @interface A11yDel : NSObject
 + (instancetype)shared;
 - (void)tap:(id)g;
@@ -886,9 +1098,10 @@ static void WriteDialAll(NSString *text) {
     NSTimeInterval nowTs = [NSDate timeIntervalSinceReferenceDate];
     if (nowTs - lastDel < 0.35) return;   // 单击手势与按钮事件可能同时到达，去抖保证一次只删一位
     lastDel = nowTs;
-    UITextField *f = gDialField;
-    NSString *cur = f.text.length ? f.text : gLastDial;
-    cur = cur ?: @"";
+    UITextField *f = DialDisplayField();
+    if (!f) f = gDialField;
+    NSString *cur = f && f.text.length ? f.text : gLastDial;
+    cur = DigitsOnly(cur ? cur : @"");
     if (cur.length == 0) {
         EnqueueAnnounce(@"号码已空");
         return;
@@ -1040,7 +1253,9 @@ static void ConfigureDeleteControl(UIView *v) {
     cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     cover.backgroundColor = [UIColor clearColor];
     cover.accessibilityLabel = @"删除";
-    cover.accessibilityTraits = UIAccessibilityTraitButton;
+    // v10：加 AllowsDirectInteraction 后旁白不再要求「先选中再双击」，手指按下抬手就删一位，
+    // 和系统电话删除键的体感一致
+    cover.accessibilityTraits = UIAccessibilityTraitButton | UIAccessibilityTraitAllowsDirectInteraction;
     cover.isAccessibilityElement = YES;
     [cover addTarget:[A11yDel shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
     // 原生电话按下的瞬间就删一位；这里补一条按下即删，抬手那一份会被去抖吃掉
@@ -1748,6 +1963,7 @@ static void AttachCellActions(void) {
         BOOL inList = (gBlacklist && [gBlacklist containsObject:d]);
         NSString *title = inList ? @"移出黑名单" : @"加入黑名单";
 
+        BOOL added = NO;
         UIView *targets[2] = {c, c.contentView};
         for (int i = 0; i < 2; i++) {
             UIView *t = targets[i];
@@ -1766,8 +1982,9 @@ static void AttachCellActions(void) {
             a.kind = inList ? 1 : 0;
             [arr addObject:a];
             t.accessibilityCustomActions = arr;
+            added = YES;
         }
-        A11yLog(@"通话行挂转子操作 %@（%@）", d, title);
+        if (added) A11yLog(@"通话行挂转子操作 %@（%@）", d, title);
     }
 }
 
@@ -1850,7 +2067,7 @@ __attribute__((constructor)) static void A11yInit(void) {
     gFooterReused = NO;
 
     // 加载探针：无论日志开关是否打开，都写一个标记文件；但「无障碍补丁已加载」只播报第一次
-    NSString *boot = [NSString stringWithFormat:@"CallA11y v13 已加载 %@\n", [NSDate date]];
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v14 已加载 %@\n", [NSDate date]];
     [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
             atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     NSString *announced = [DocDir() stringByAppendingPathComponent:@"a11y_announced.txt"];
@@ -1862,13 +2079,14 @@ __attribute__((constructor)) static void A11yInit(void) {
             UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载，之后不会再提示");
         });
     }
-    A11yLog(@"CallA11y v13 载入，日志开关=%d", gLogEnabled);
+    A11yLog(@"CallA11y v14 载入，日志开关=%d", gLogEnabled);
 
     // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:3.0
                                                      repeats:YES
                                                        block:^(NSTimer *t) {
         ScanDelete(KeyWindowNow());
+        AttachPadTaps();
         AttachSettingsEntries();
         AttachFloatingEntries();
         AttachBlacklistButton();
@@ -1876,5 +2094,13 @@ __attribute__((constructor)) static void A11yInit(void) {
         SweepSettingsIfNeeded();
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+
+    // 0.25 秒看门狗：App 往输入框里塞区号/整串号码时立刻截回用户实际敲的长度
+    NSTimer *pulse = [NSTimer scheduledTimerWithTimeInterval:0.25
+                                                     repeats:YES
+                                                       block:^(NSTimer *t) {
+        EnforceDialText();
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:pulse forMode:NSRunLoopCommonModes];
 }
 
