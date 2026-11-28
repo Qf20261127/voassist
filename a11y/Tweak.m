@@ -1198,12 +1198,164 @@ static void AttachSettingsEntries(void) {
     [nav.navigationItem setRightBarButtonItems:items animated:NO];
 }
 
+
+// ---- v6：最近通话行加“加入黑名单”按钮 + 呼入/呼出方向播报 ----
+
+static UITableView *FindFirstTable(UIView *root, int depth) {
+    if (!root || depth > 12) return nil;
+    if ([root isKindOfClass:[UITableView class]]) return (UITableView *)root;
+    for (UIView *s in root.subviews) {
+        UITableView *t = FindFirstTable(s, depth + 1);
+        if (t) return t;
+    }
+    return nil;
+}
+
+static IMP gOrigA11yLabel = NULL;
+
+// 读原始 accessibilityLabel，不经过我们自己的 hook，避免递归
+static NSString *RawA11yLabel(UIView *v) {
+    if (!v || !gOrigA11yLabel) return nil;
+    id r = ((id (*)(id, SEL))gOrigA11yLabel)(v, @selector(accessibilityLabel));
+    return [r isKindOfClass:[NSString class]] ? (NSString *)r : nil;
+}
+
+static NSString *DirectionOf(UIView *root, int depth) {
+    if (!root || depth > 8) return nil;
+    NSString *l = RawA11yLabel(root);
+    if (l.length) {
+        if ([l rangeOfString:@"未接"].location != NSNotFound) return @"未接";
+        if ([l rangeOfString:@"呼入"].location != NSNotFound) return @"呼入";
+        if ([l rangeOfString:@"呼出"].location != NSNotFound) return @"呼出";
+    }
+    if ([root isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)root).text;
+        if (t.length) {
+            if ([t rangeOfString:@"未接"].location != NSNotFound) return @"未接";
+            if ([t rangeOfString:@"呼入"].location != NSNotFound) return @"呼入";
+            if ([t rangeOfString:@"呼出"].location != NSNotFound) return @"呼出";
+        }
+    }
+    for (UIView *s in root.subviews) {
+        NSString *d = DirectionOf(s, depth + 1);
+        if (d) return d;
+    }
+    return nil;
+}
+
+static id HookA11yLabel(id self, SEL cmd) {
+    id base = ((id (*)(id, SEL))gOrigA11yLabel)(self, cmd);
+    if (![self isKindOfClass:[UIView class]]) return base;
+    NSString *s = [base isKindOfClass:[NSString class]] ? (NSString *)base : nil;
+    if (!s.length) return base;
+    if ([s rangeOfString:@"黑名单"].location != NSNotFound) return base;
+    NSString *digits = LongestDigits(s, 7);
+    if (!digits) return base;
+    NSString *dir = DirectionOf((UIView *)self, 0);
+    if (!dir) return base;
+    if ([s rangeOfString:dir].location != NSNotFound) return base;
+    return [NSString stringWithFormat:@"%@ %@", dir, s];
+}
+
+static void InstallA11yLabelHook(void) {
+    Class UIView_ = objc_getClass("UIView");
+    if (!UIView_) return;
+    Method m = class_getInstanceMethod(UIView_, @selector(accessibilityLabel));
+    if (m) gOrigA11yLabel = method_setImplementation(m, (IMP)HookA11yLabel);
+}
+
+static void AddToBlacklistNow(NSString *digits) {
+    if (digits.length == 0) return;
+    if (!gBlacklist) gBlacklist = [NSMutableArray array];
+    if (![gBlacklist containsObject:digits]) [gBlacklist addObject:digits];
+    NSString *p = [DocDir() stringByAppendingPathComponent:@"a11y_blacklist.plist"];
+    [gBlacklist writeToFile:p atomically:YES];
+}
+
+@interface A11yBlkBtn : NSObject
++ (instancetype)shared;
+- (void)ask;
+@end
+
+@implementation A11yBlkBtn
++ (instancetype)shared { static A11yBlkBtn *o; static dispatch_once_t t; dispatch_once(&t, ^{ o = [A11yBlkBtn new]; }); return o; }
+
+- (void)ask {
+    UIViewController *vc = KeyWindowNow().rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if ([vc isKindOfClass:[UINavigationController class]]) vc = ((UINavigationController *)vc).topViewController;
+    if (!vc) return;
+
+    NSString *digits = nil;
+    id focused = UIAccessibilityFocusedElement(UIAccessibilityScreenChangedNotification);
+    if (focused && [focused isKindOfClass:[UIView class]]) digits = LongestDigits(RawA11yLabel((UIView *)focused), 7);
+    if (!digits) {
+        UITableView *tv = FindFirstTable(vc.view, 0);
+        for (UITableViewCell *c in [tv visibleCells]) {
+            NSString *d = LongestDigits(RawA11yLabel(c), 7);
+            if (d) { digits = d; break; }
+        }
+    }
+    if (!digits) { EnqueueAnnounce(@"没有找到号码，请先把焦点放到某条通话记录上"); return; }
+
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"加入黑名单"
+                                                               message:[NSString stringWithFormat:@"号码 %@", digits]
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        AddToBlacklistNow(digits);
+        A11yLog(@"手动加入黑名单 %@", digits);
+        EnqueueAnnounce([NSString stringWithFormat:@"已加入黑名单 %@", digits]);
+    }]];
+    [al addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [vc presentViewController:al animated:YES completion:nil];
+}
+@end
+
+static char kBlkBtnKey;
+
+static void AttachBlacklistButton(void) {
+    UIWindow *win = KeyWindowNow();
+    if (!win) return;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if ([top isKindOfClass:[UINavigationController class]])
+        top = ((UINavigationController *)top).topViewController;
+    UIView *root = top.view;
+    if (!root) return;
+    if (objc_getAssociatedObject(root, &kBlkBtnKey)) return;
+    UITableView *tv = FindFirstTable(root, 0);
+    if (!tv) return;
+    NSInteger rows = 0;
+    for (UITableViewCell *c in [tv visibleCells]) {
+        if (LongestDigits(RawA11yLabel(c), 7)) rows++;
+    }
+    if (rows < 2) return;
+    objc_setAssociatedObject(root, &kBlkBtnKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    CGFloat w = 132, h = 40;
+    CGFloat y = root.bounds.size.height - 83 - 56;
+    b.frame = CGRectMake(root.bounds.size.width - w - 12, y, w, h);
+    [b setTitle:@"加入黑名单" forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.94];
+    b.layer.cornerRadius = 10;
+    b.layer.borderWidth = 0.5;
+    b.layer.borderColor = [UIColor colorWithWhite:0.7 alpha:1].CGColor;
+    b.accessibilityLabel = @"加入黑名单";
+    b.accessibilityTraits = UIAccessibilityTraitButton;
+    [b addTarget:[A11yBlkBtn shared] action:@selector(ask) forControlEvents:UIControlEventTouchUpInside];
+    [root addSubview:b];
+    A11yLog(@"最近通话页放上加入黑名单按钮（行数=%ld）", (long)rows);
+}
+
 __attribute__((constructor)) static void A11yInit(void) {
     Class UILabel_ = objc_getClass("UILabel");
     Class UITextField_ = objc_getClass("UITextField");
     InstallTextHook(UILabel_, &gOrigSetText, (IMP)HookSetText, "setText:");
     InstallTextHook(UILabel_, &gOrigSetAttrText, (IMP)HookSetAttrText, "setAttributedText:");
     InstallTextHook(UITextField_, &gOrigTFSetText, (IMP)HookTFSetText, "setText:");
+    InstallA11yLabelHook();
 
     Class UIView_ = objc_getClass("UIView");
     if (UIView_) {
@@ -1233,6 +1385,7 @@ __attribute__((constructor)) static void A11yInit(void) {
         ScanDelete(KeyWindowNow());
         AttachSettingsEntries();
         AttachFloatingEntries();
+        AttachBlacklistButton();
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
 }
