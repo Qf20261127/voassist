@@ -109,6 +109,15 @@ static void EnqueueAnnounce(NSString *msg) {
     UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, msg);
 }
 
+// 点完列表行旁白会紧接着念单元格名，立刻播报会被它压掉，延后一点再念
+static void AnnounceSoon(NSString *msg) {
+    if (msg.length == 0) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, msg);
+    });
+}
+
 static void DrainQueue(void) {}
 
 static NSString *gLastDial = nil;
@@ -435,13 +444,13 @@ static NSString *WriteDumpNow(UIWindow *win);
         [[NSFileManager defaultManager] removeItemAtPath:f[@"path"] error:NULL];
     }
     [self reloadFiles];
-    EnqueueAnnounce(@"日志已全部清空");
+    AnnounceSoon([NSString stringWithFormat:@"日志已全部清空，还剩 %lu 个文件", (unsigned long)self.files.count]);
 }
 
 - (void)makeSnapshot {
     NSString *p = WriteDumpNow(KeyWindowNow());
     [self reloadFiles];
-    EnqueueAnnounce(p.length ? @"界面快照已生成" : @"快照生成失败");
+    AnnounceSoon(p.length ? @"界面快照已生成" : @"快照生成失败");
 }
 
 - (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)ip {
@@ -708,12 +717,17 @@ static void HookTFSetText(id self, SEL cmd, NSString *text) {
     NSString *why = @"";
     if ([newD isEqualToString:curD]) {
         ok = YES;                                 // 同一内容（格式化/非格式化两份）重复写入
+    } else if (curD.length == 0) {
+        ok = (newD.length == 1);                  // 第一下按键：只接受一位
+        if (!ok) why = @"首键多位";
     } else if (newD.length == curD.length + 1 && [newD hasPrefix:curD]) {
         ok = YES;                                 // 用户敲了一位
-    } else if (curD.length >= 1 && newD.length + 1 == curD.length && [curD hasPrefix:newD]) {
+    } else if (newD.length + 1 == curD.length && newD.length > 0 && [curD hasPrefix:newD]) {
         ok = YES;                                 // 用户删了一位
     } else if (newD.length == 0) {
         ok = YES;                                 // 清空
+    } else if (newD.length == 1) {
+        ok = YES;                                 // 重新起号：App 把旧号整体换成一位
     } else {
         why = @"跳变填充";
     }
@@ -723,8 +737,10 @@ static void HookTFSetText(id self, SEL cmd, NSString *text) {
         if (![f.text isEqualToString:curD]) {
             ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, curD);
         }
-        A11yLog(@"拦截自动填充：%@ -> 保持 %@（field=%@ 父=%@ %@）", text, curD,
-                NSStringFromClass([f class]), NSStringFromClass([f.superview class]), why);
+        A11yLog(@"拦截自动填充：%@ -> 保持 %@（field=%@ 父=%@ %@ 原始长度%lu 新长度%lu 旧长度%lu）", text, curD,
+                NSStringFromClass([f class]), NSStringFromClass([f.superview class]), why,
+                (unsigned long)([text isKindOfClass:[NSString class]] ? [(NSString *)text length] : 0),
+                (unsigned long)newD.length, (unsigned long)curD.length);
         gLastDial = curD;
         gDialField = f;
         RefreshBarFor(curD);
@@ -918,6 +934,8 @@ static void ConfigureDeleteControl(UIView *v) {
     cover.accessibilityTraits = UIAccessibilityTraitButton;
     cover.isAccessibilityElement = YES;
     [cover addTarget:[A11yDel shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+    // 原生电话按下的瞬间就删一位；这里补一条按下即删，抬手那一份会被去抖吃掉
+    [cover addTarget:[A11yDel shared] action:@selector(tap:) forControlEvents:UIControlEventTouchDown];
     UITapGestureRecognizer *ct = [[UITapGestureRecognizer alloc] initWithTarget:[A11yDel shared] action:@selector(tap:)];
     [cover addGestureRecognizer:ct];
 
@@ -1660,6 +1678,18 @@ static void CleanTextSweep(UIView *v, int depth) {
                 [(UIButton *)v setTitle:f forState:UIControlStateNormal];
             }
         }
+        if ([v isKindOfClass:[UISegmentedControl class]]) {
+            // 分段控件是自绘的，改子标签没用，得直接改每一段的标题
+            UISegmentedControl *seg = (UISegmentedControl *)v;
+            for (NSInteger i = 0; i < (NSInteger)seg.numberOfSegments; i++) {
+                NSString *t = [seg titleForSegmentAtIndex:i];
+                NSString *f = FilterEnglish(t);
+                if (f && ![f isEqualToString:t]) {
+                    [seg setTitle:f forSegmentAtIndex:i];
+                    A11yLog(@"英文清理(分段)：%@ -> %@", t, f);
+                }
+            }
+        }
     }
     for (UIView *s in v.subviews) CleanTextSweep(s, depth + 1);
 }
@@ -1699,15 +1729,20 @@ __attribute__((constructor)) static void A11yInit(void) {
     LoadContactsIfNeeded();
     gFooterReused = NO;
 
-    // 加载探针：无论日志开关是否打开，都写一个标记文件并播报一次
-    NSString *boot = [NSString stringWithFormat:@"CallA11y v10 已加载 %@\n", [NSDate date]];
+    // 加载探针：无论日志开关是否打开，都写一个标记文件；但「无障碍补丁已加载」只播报第一次
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v11 已加载 %@\n", [NSDate date]];
     [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
             atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载");
-    });
-    A11yLog(@"CallA11y v10 载入，日志开关=%d", gLogEnabled);
+    NSString *announced = [DocDir() stringByAppendingPathComponent:@"a11y_announced.txt"];
+    BOOL firstTime = ![[NSFileManager defaultManager] fileExistsAtPath:announced];
+    if (firstTime) {
+        [@"1" writeToFile:announced atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载，之后不会再提示");
+        });
+    }
+    A11yLog(@"CallA11y v11 载入，日志开关=%d", gLogEnabled);
 
     // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:3.0
