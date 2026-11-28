@@ -67,6 +67,7 @@ static BOOL HasLatinLetter(NSString *s) {
 // 纯英文单词保留（拨号键上的 ABC、DEF 不能被清掉）；纯数字/符号串保留。
 static NSString *FilterEnglish(NSString *raw) {
     if (![raw isKindOfClass:[NSString class]] || raw.length == 0) return raw;
+    if (raw.length > 120) return raw;   // 长文本（网页/整段说明）一律不动，避免整段被清空并拖慢 UI
     if (!HasLatinLetter(raw)) return raw;
 
     if (HasNonASCII(raw)) {
@@ -103,26 +104,16 @@ static UIWindow *KeyWindowNow(void);
 
 static void EnqueueAnnounce(NSString *msg) {
     if (msg.length == 0) return;
-    if (!gQueue) gQueue = [NSMutableArray array];
-    [gQueue addObject:msg];
-    DrainQueue();
+    // 去掉原来的 1 秒闸门：连点时后一条会被压住，听起来就是“没提示”
+    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, msg);
 }
 
-static void DrainQueue(void) {
-    if (gSpeaking || gQueue.count == 0) return;
-    gSpeaking = YES;
-    NSString *m = gQueue[0];
-    [gQueue removeObjectAtIndex:0];
-    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, m);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        gSpeaking = NO;
-        DrainQueue();
-    });
-}
+static void DrainQueue(void) {}
 
 static NSString *gLastDial = nil;
 static UITextField *gDialField = nil;
+static NSString *gUserTyped = nil;   // 用户自己敲进去的数字，用来识别 App 的自动补全
+static BOOL gAllowFullFill = NO;     // 用户主动选号（点候选）时放行一次完整号码
 
 static BOOL LooksLikeDial(id obj) {
     if (![obj isKindOfClass:[NSString class]]) return NO;
@@ -561,6 +552,7 @@ static NSString *WriteDumpNow(UIWindow *win);
     if (digits.length == 0) return;
     UITextField *f = gDialField;
     if (f) {
+        gAllowFullFill = YES;
         f.text = digits;
         [f sendActionsForControlEvents:UIControlEventEditingChanged];
         gLastDial = digits;
@@ -647,6 +639,36 @@ static void HookSetAttrText(id self, SEL cmd, NSAttributedString *text) {
 }
 
 static void HookTFSetText(id self, SEL cmd, NSString *text) {
+    if (![text isKindOfClass:[NSString class]]) {
+        ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, text);
+        return;
+    }
+    NSString *newD = DigitsOnly(text);
+    NSString *curD = gUserTyped ? gUserTyped : @"";
+    BOOL autoFill = NO;
+    if (!gAllowFullFill && newD.length >= 7 && curD.length < 7 &&
+        (curD.length == 0 || [newD hasPrefix:curD])) {
+        autoFill = YES;
+    }
+    if (autoFill) {
+        UITextField *f = (UITextField *)self;
+        if (gOrigTFSetText && ![f.text isEqualToString:curD]) {
+            ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, curD);
+        }
+        A11yLog(@"拦截自动补全：%@ -> 保持 %@", text, curD);
+        gLastDial = curD;
+        gDialField = f;
+        RefreshBarFor(curD);
+        return;
+    }
+    if (gAllowFullFill) {
+        gAllowFullFill = NO;
+        gUserTyped = newD;
+    } else if (newD.length > 0 && newD.length < 7) {
+        gUserTyped = newD;
+    } else if (newD.length == 0) {
+        gUserTyped = @"";
+    }
     TrackDial(self, text);
     ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, text);
 }
@@ -660,7 +682,7 @@ static void InstallTextHook(Class cls, IMP *slot, IMP hook, const char *selName)
 
 @interface A11yDel : NSObject
 + (instancetype)shared;
-- (void)tap:(UITapGestureRecognizer *)g;
+- (void)tap:(id)g;
 - (void)longPress:(UILongPressGestureRecognizer *)g;
 @end
 
@@ -673,24 +695,26 @@ static void InstallTextHook(Class cls, IMP *slot, IMP hook, const char *selName)
     return s;
 }
 
-- (void)tap:(UITapGestureRecognizer *)g {
+- (void)tap:(id)g {
     UITextField *f = gDialField;
     NSString *cur = f.text.length ? f.text : gLastDial;
     cur = cur ?: @"";
     if (cur.length == 0) {
         EnqueueAnnounce(@"号码已空");
-        A11yLog(@"删除键命中，当前已空");
         return;
     }
     NSString *after = [cur substringToIndex:cur.length - 1];
     if (f) {
-        f.text = after;
+        // 绕过 setText 的补全拦截，直接写回，保证一次点击只减一位
+        if (gOrigTFSetText)
+            ((void (*)(id, SEL, NSString *))gOrigTFSetText)((id)f, @selector(setText:), after);
         [f sendActionsForControlEvents:UIControlEventEditingChanged];
     }
     gLastDial = after;
+    gUserTyped = DigitsOnly(after);
     if (after.length == 0) EnqueueAnnounce(@"号码已清空");
-    else EnqueueAnnounce([NSString stringWithFormat:@"已删除，当前 %@", after]);
-    A11yLog(@"删除键命中，剩 %@", after);
+    else EnqueueAnnounce([NSString stringWithFormat:@"删除一位，还剩 %@", after]);
+    A11yLog(@"删除一位，剩 %@", after);
 }
 
 - (void)longPress:(UILongPressGestureRecognizer *)g {
@@ -806,19 +830,26 @@ static UIView *FindGeometricDelete(UIView *root, CGRect bounds, int depth, UIVie
 static void ConfigureDeleteControl(UIView *v) {
     if (objc_getAssociatedObject(v, &kDelKey1)) return;
     objc_setAssociatedObject(v, &kDelKey1, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    v.isAccessibilityElement = YES;
-    v.accessibilityLabel = @"删除";
-    v.accessibilityTraits = UIAccessibilityTraitButton | UIAccessibilityTraitAllowsDirectInteraction;
 
-    UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:[A11yDel shared] action:@selector(tap:)];
-    t.cancelsTouchesInView = YES;   // 由我们独占处理，避免原生按钮再删一次造成双删
-    [v addGestureRecognizer:t];
+    // 手指点击只允许走一条路径：在原生删除按钮上盖一层透明按钮，原生收不到 touch，
+    // 从根本上消除「点一次删两位」。
+    UIButton *cover = [UIButton buttonWithType:UIButtonTypeCustom];
+    cover.frame = v.bounds;
+    cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    cover.backgroundColor = [UIColor clearColor];
+    cover.accessibilityLabel = @"删除";
+    cover.accessibilityTraits = UIAccessibilityTraitButton;
+    cover.isAccessibilityElement = YES;
+    [cover addTarget:[A11yDel shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
 
     UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
         initWithTarget:[A11yDel shared] action:@selector(longPress:)];
     lp.minimumPressDuration = 0.7;
     lp.cancelsTouchesInView = YES;
-    [v addGestureRecognizer:lp];
+    [cover addGestureRecognizer:lp];
+
+    v.isAccessibilityElement = NO;
+    [v addSubview:cover];
 }
 
 static UIView *gDelControl = nil;
@@ -846,12 +877,17 @@ static void ScanDelete(UIWindow *win) {
             ConfigureDeleteControl(g);
         }
     }
-    if (gDelControl) {
-        A11yLog(@"删除键命中：%@ frame=%@ 方式=%@", NSStringFromClass([gDelControl class]),
-                NSStringFromCGRect([gDelControl convertRect:gDelControl.bounds toView:nil]),
-                byGeom ? @"几何兜底" : @"标签");
-    } else {
-        A11yLog(@"删除键未命中，拨号盘判定=%d", LooksLikeDialPad(win));
+    static NSString *lastKey = nil;
+    NSString *nowKey = gDelControl ? NSStringFromClass([gDelControl class]) : @"none";
+    if (!lastKey || ![lastKey isEqualToString:nowKey]) {
+        lastKey = nowKey;
+        if (gDelControl) {
+            A11yLog(@"删除键已挂接：%@ frame=%@ 方式=%@", NSStringFromClass([gDelControl class]),
+                    NSStringFromCGRect([gDelControl convertRect:gDelControl.bounds toView:nil]),
+                    byGeom ? @"几何兜底" : @"标签");
+        } else {
+            A11yLog(@"删除键未命中，拨号盘判定=%d", LooksLikeDialPad(win));
+        }
     }
 }
 
@@ -1038,20 +1074,23 @@ static void RefreshBarFor(NSString *typed) {
         NSArray *cands = MatchCandidates(q);
         A11yLog(@"候选刷新 输入=%@ 命中=%lu 条 联系人库=%lu", q, (unsigned long)cands.count,
                 (unsigned long)gContacts.count);
-        if (cands.count == 0 && !gBar) return;
+        if (cands.count == 0) {
+            RemoveBar();
+            gBarKey = q;
+            A11yLog(@"候选为空 输入=%@", q);
+            return;
+        }
         gBarKey = q;
 
-        UIWindow *win = KeyWindowNow();
+        // App 有多个 window，用 keyWindow 会把条加到别的层上，界面上就看不见
+        UIWindow *win = gDialField.window ? gDialField.window : KeyWindowNow();
         if (!win) return;
 
-        // 候选条贴在号码输入区正下方（和原生那行「会员 235 号…」同一块区域），不再沉到底部
         CGFloat h = 44;
         CGFloat y = win.bounds.size.height - 320;
         if (gDialField) {
-            UIView *box = gDialField.superview ? gDialField.superview : gDialField;
-            CGRect r = [box convertRect:box.bounds toView:win];
-            if (r.size.height > 0 && r.size.height < 400)
-                y = CGRectGetMaxY(r) + 4;
+            CGRect r = [gDialField convertRect:gDialField.bounds toView:win];
+            if (r.size.height > 0 && r.size.width > 0) y = CGRectGetMaxY(r) + 2;
         }
         CGRect barFrame = CGRectMake(8, y, win.bounds.size.width - 16, h);
 
@@ -1071,6 +1110,10 @@ static void RefreshBarFor(NSString *typed) {
             gBarStack.spacing = 6;
             [gBarScroll addSubview:gBarStack];
             [gBar addSubview:gBarScroll];
+            [win addSubview:gBar];
+        }
+        if (gBar.superview != win) {
+            [gBar removeFromSuperview];
             [win addSubview:gBar];
         }
 
@@ -1323,6 +1366,51 @@ static void AddToBlacklistNow(NSString *digits) {
 @end
 
 static char kBlkBtnKey;
+static UIButton *gBlkBtn = nil;
+
+static UITabBar *FindTabBar(UIView *root, int depth) {
+    if (!root || depth > 12) return nil;
+    if ([root isKindOfClass:[UITabBar class]]) return (UITabBar *)root;
+    for (UIView *s in root.subviews) {
+        UITabBar *t = FindTabBar(s, depth + 1);
+        if (t) return t;
+    }
+    return nil;
+}
+
+static BOOL HasRecentCallsHint(UIView *root, int depth) {
+    if (!root || depth > 14) return NO;
+    if ([root isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)root).text;
+        if (t.length) {
+            if ([t rangeOfString:@"今天"].location != NSNotFound ||
+                [t rangeOfString:@"昨天"].location != NSNotFound ||
+                [t rangeOfString:@"星期"].location != NSNotFound) return YES;
+        }
+    }
+    for (UIView *s in root.subviews) if (HasRecentCallsHint(s, depth + 1)) return YES;
+    return NO;
+}
+
+// 只在「最近通话」页挂按钮：拨号盘/通讯录/收藏/语音留言一律不挂
+static BOOL IsRecentCallsPage(UIView *root) {
+    if (HasClassFrag(root, @"DialerNumberPad", 0)) return NO;
+    if (HasClassFrag(root, @"ZSKeyPadView", 0)) return NO;
+    UITabBar *tb = FindTabBar(root, 0);
+    if (tb && tb.selectedItem) {
+        NSString *t = tb.selectedItem.title;
+        if (!t.length) t = tb.selectedItem.accessibilityLabel;
+        if (t.length && [t rangeOfString:@"最近"].location != NSNotFound) return YES;
+    }
+    return HasRecentCallsHint(root, 0);
+}
+
+static void RemoveBlkBtn(void) {
+    if (gBlkBtn) {
+        [gBlkBtn removeFromSuperview];
+        gBlkBtn = nil;
+    }
+}
 
 static void AttachBlacklistButton(void) {
     UIWindow *win = KeyWindowNow();
@@ -1333,16 +1421,21 @@ static void AttachBlacklistButton(void) {
         top = ((UINavigationController *)top).topViewController;
     UIView *root = top.view;
     if (!root) return;
-    if (objc_getAssociatedObject(root, &kBlkBtnKey)) return;
+
+    if (!IsRecentCallsPage(root)) {
+        RemoveBlkBtn();
+        return;
+    }
     UITableView *tv = FindFirstTable(root, 0);
-    if (!tv) return;
+    if (!tv) { RemoveBlkBtn(); return; }
     NSInteger rows = 0;
     for (UITableViewCell *c in [tv visibleCells]) {
         if (LongestDigits(RawA11yLabel(c), 7)) rows++;
     }
-    if (rows < 2) return;
-    objc_setAssociatedObject(root, &kBlkBtnKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (rows < 1) { RemoveBlkBtn(); return; }
+    if (gBlkBtn && gBlkBtn.superview == root) return;
 
+    RemoveBlkBtn();
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     CGFloat w = 132, h = 40;
     CGFloat y = root.bounds.size.height - 83 - 56;
@@ -1357,6 +1450,7 @@ static void AttachBlacklistButton(void) {
     b.accessibilityTraits = UIAccessibilityTraitButton;
     [b addTarget:[A11yBlkBtn shared] action:@selector(ask) forControlEvents:UIControlEventTouchUpInside];
     [root addSubview:b];
+    gBlkBtn = b;
     A11yLog(@"最近通话页放上加入黑名单按钮（行数=%ld）", (long)rows);
 }
 
@@ -1380,17 +1474,17 @@ __attribute__((constructor)) static void A11yInit(void) {
     gFooterReused = NO;
 
     // 加载探针：无论日志开关是否打开，都写一个标记文件并播报一次
-    NSString *boot = [NSString stringWithFormat:@"CallA11y v4 已加载 %@\n", [NSDate date]];
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v7 已加载 %@\n", [NSDate date]];
     [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
             atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载");
     });
-    A11yLog(@"CallA11y v4 载入，日志开关=%d", gLogEnabled);
+    A11yLog(@"CallA11y v7 载入，日志开关=%d", gLogEnabled);
 
     // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
-    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:2.0
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:3.0
                                                      repeats:YES
                                                        block:^(NSTimer *t) {
         ScanDelete(KeyWindowNow());
