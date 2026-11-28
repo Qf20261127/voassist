@@ -26,7 +26,7 @@ jobs:
             -miphoneos-version-min=15.0 \
             -fobjc-arc -O2 -dynamiclib \
             -install_name @executable_path/CallA11y.dylib \
-            -framework UIKit -framework Foundation -framework Contacts \
+            -framework UIKit -framework Foundation -framework Contacts -framework CoreGraphics \
             -o CallA11y.dylib a11y/Tweak.m
           ldid -S CallA11y.dylib
           lipo -info CallA11y.dylib
