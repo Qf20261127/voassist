@@ -467,7 +467,6 @@ static NSString *WriteDumpNow(UIWindow *win);
 - (void)tapCandidate:(UIButton *)sender;
 - (void)openBlacklist;
 - (void)openLogs;
-- (void)tapOpenLogs:(id)sender;
 @end
 
 @interface A11yBlackVC : UITableViewController
@@ -576,10 +575,6 @@ static NSString *WriteDumpNow(UIWindow *win);
     [self presentModal:[[A11yLogVC alloc] init]];
 }
 
-- (void)tapOpenLogs:(id)sender {
-    [self openLogs];
-}
-
 @end
 
 static IMP gOrigSetText = NULL;
@@ -594,38 +589,14 @@ static void TrackDial(id self, NSString *text) {
     RefreshBarFor(text);
 }
 
-static BOOL gFooterReused = NO;
-
-static BOOL IsFooterEnglish(NSString *s) {
-    if (![s isKindOfClass:[NSString class]]) return NO;
-    NSString *l = [s lowercaseString];
-    if ([l rangeOfString:@"update address"].location != NSNotFound) return YES;
-    if ([l rangeOfString:@"free and will not charge"].location != NSNotFound) return YES;
-    if ([l rangeOfString:@"be cheated"].location != NSNotFound) return YES;
-    return NO;
-}
+static BOOL gFooterReused = NO;   // 保留占位，不做页脚改造
 
 static void HookSetText(id self, SEL cmd, NSString *text) {
     NSString *t = text;
     if ([t isKindOfClass:[NSString class]]) {
         TrackDial(self, t);
         if ([self isKindOfClass:[UIView class]] && InSettingsArea((UIView *)self)) {
-            if (!gFooterReused && IsFooterEnglish(t)) {
-                // 复用原来页脚那几行英文的焦点，改成「无障碍日志」入口
-                gFooterReused = YES;
-                UIView *v = (UIView *)self;
-                v.userInteractionEnabled = YES;
-                v.isAccessibilityElement = YES;
-                v.accessibilityLabel = @"无障碍日志";
-                v.accessibilityTraits = UIAccessibilityTraitButton;
-                UITapGestureRecognizer *gt =
-                    [[UITapGestureRecognizer alloc] initWithTarget:[A11yHelper shared] action:@selector(tapOpenLogs:)];
-                [v addGestureRecognizer:gt];
-                t = @"无障碍日志";
-                A11yLog(@"页脚英文改为无障碍日志入口");
-            } else {
-                t = FilterEnglish(t);
-            }
+            t = FilterEnglish(t);
         }
     }
     ((void (*)(id, SEL, NSString *))gOrigSetText)(self, cmd, t);
