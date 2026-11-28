@@ -931,6 +931,8 @@ static void WriteDialAll(NSString *text) {
     return YES;
 }
 @end
+
+static char kDelKey1;
 static char kDumpDone;
 
 static BOOL IsSingleDigitText(NSString *t) {
