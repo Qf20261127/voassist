@@ -1089,8 +1089,13 @@ static void RefreshBarFor(NSString *typed) {
         CGFloat h = 44;
         CGFloat y = win.bounds.size.height - 320;
         if (gDialField) {
+            UIView *box = gDialField.superview;
+            CGRect rb = box ? [box convertRect:box.bounds toView:win] : CGRectZero;
             CGRect r = [gDialField convertRect:gDialField.bounds toView:win];
-            if (r.size.height > 0 && r.size.width > 0) y = CGRectGetMaxY(r) + 2;
+            if (rb.size.height > 0 && rb.size.height < 400 && CGRectGetMaxY(rb) > CGRectGetMaxY(r))
+                y = CGRectGetMaxY(rb) + 2;   // 排在原生「会员 235 号…」那一行的下面
+            else if (r.size.height > 0 && r.size.width > 0)
+                y = CGRectGetMaxY(r) + 2;
         }
         CGRect barFrame = CGRectMake(8, y, win.bounds.size.width - 16, h);
 
