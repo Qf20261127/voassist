@@ -78,11 +78,22 @@ static NSString *FilterEnglish(NSString *raw) {
         });
         NSArray *parts = [raw componentsSeparatedByCharactersInSet:seps];
         NSMutableArray *keep = [NSMutableArray array];
+        BOOL rawHasCJK = HasNonASCII(raw);
         for (NSString *p in parts) {
-            if (!HasLatinLetter(p)) {
-                NSString *t = TrimStr(p);
-                if (t.length) [keep addObject:t];
+            if (HasLatinLetter(p)) continue;
+            NSString *t = TrimStr(p);
+            if (!t.length) continue;
+            // 「1.0.2」「2026/11/28」「https://…」这类纯数字/纯符号碎片不要把版本号拆成一串噪声
+            if (rawHasCJK && t.length <= 8) {
+                BOOL onlyDigitsPunct = YES;
+                for (NSUInteger i = 0; i < t.length; i++) {
+                    unichar c = [t characterAtIndex:i];
+                    if (!((c >= '0' && c <= '9') || c == ' ' || c == ':' || c == '-' || c == '#' ||
+                          c == '+' || c == '.' || c == '_' || c == '~')) { onlyDigitsPunct = NO; break; }
+                }
+                if (onlyDigitsPunct) continue;
             }
+            [keep addObject:t];
         }
         if (keep.count == 0) return @"";
         return TrimStr([keep componentsJoinedByString:@" "]);
@@ -692,6 +703,55 @@ static NSString *StripAutoZero(NSString *newD, NSString *curD) {
     return newD;
 }
 
+static IMP gOrigInsertText = NULL;
+static IMP gOrigReplaceRange = NULL;
+
+static void WriteDialAll(NSString *text);          // 定义在后面
+static void RefreshBarFor(NSString *typed);
+
+static void HookInsertText(id self, SEL cmd, NSString *text) {
+    if (![self isKindOfClass:[UITextField class]] || !InDialerArea((UIView *)self) ||
+        ![text isKindOfClass:[NSString class]]) {
+        ((void (*)(id, SEL, NSString *))gOrigInsertText)(self, cmd, text);
+        return;
+    }
+    NSString *d = DigitsOnly(text);
+    if (d.length != text.length || d.length == 0) {
+        if (text.length > 1) A11yLog(@"拦截插入文本：%@（当前 %@）", text, gUserTyped ?: @"");
+        return;                                  // 一次插多位 = 自动填号，整段丢掉
+    }
+    // 一位数字：按用户按键处理，但间隔过密就当成自动连写
+    NSTimeInterval nowTs = [NSDate timeIntervalSinceReferenceDate];
+    if (gLastAccept > 0 && nowTs - gLastAccept < 0.20) {
+        A11yLog(@"拦截插入（瞬时）：%@（当前 %@）", text, gUserTyped ?: @"");
+        return;
+    }
+    NSString *curD = gUserTyped ? gUserTyped : @"";
+    NSString *newD = StripAutoZero(curD.length ? [curD stringByAppendingString:d] : d, curD);
+    gUserTyped = newD;
+    gLastDial = newD;
+    gLastAccept = nowTs;
+    gDialField = (UITextField *)self;
+    A11yLog(@"拨号文本（插入）：%@", newD);
+    WriteDialAll(newD);
+    RefreshBarFor(newD);
+}
+
+static void HookReplaceRange(id self, SEL cmd, UITextRange *range, NSString *text) {
+    NSString *d = [text isKindOfClass:[NSString class]] ? DigitsOnly(text) : @"";
+    if ([self isKindOfClass:[UITextField class]] && InDialerArea((UIView *)self)) {
+        if (d.length > 1) {
+            A11yLog(@"拦截替换文本：%@（当前 %@）", text, gUserTyped ?: @"");
+            return;
+        }
+        if (d.length == 0 && [text isKindOfClass:[NSString class]] && text.length > 0) {
+            A11yLog(@"拦截替换文本：%@（当前 %@）", text, gUserTyped ?: @"");
+            return;
+        }
+    }
+    ((void (*)(id, SEL, UITextRange *, NSString *))gOrigReplaceRange)(self, cmd, range, text);
+}
+
 static void HookTFSetText(id self, SEL cmd, NSString *text) {
     if (![text isKindOfClass:[NSString class]] ||
         ![self isKindOfClass:[UITextField class]] ||
@@ -755,6 +815,17 @@ static void HookTFSetText(id self, SEL cmd, NSString *text) {
                 (unsigned long)newD.length, (unsigned long)curD.length);
         gLastDial = curD;
         gDialField = f;
+        // App 有时在我们回写之后又用内部路径把整号塞回来，0.15 秒后核对一次，仍然不对就再写回去
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UITextField *ff = f;
+            if (!ff || !gUserTyped) return;
+            NSString *want = gUserTyped;
+            if (ff.text.length && ![ff.text isEqualToString:want]) {
+                ((void (*)(id, SEL, NSString *))gOrigTFSetText)((id)ff, @selector(setText:), want);
+                A11yLog(@"二次回写：%@（原 %@）", want, ff.text);
+            }
+        });
         RefreshBarFor(curD);
         return;
     }
@@ -830,7 +901,7 @@ static void WriteDialAll(NSString *text) {
     gLastDial = after;
     gUserTyped = DigitsOnly(after);
     NSString *msg = after.length ? [NSString stringWithFormat:@"删除一位，还剩 %@", after] : @"号码已清空";
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, msg);
     });
@@ -849,7 +920,17 @@ static void WriteDialAll(NSString *text) {
 
 @end
 
-static char kDelKey1;
+// 旁白「轻点两下」会走 accessibilityActivate，接到这里保证一次激活只删一位，
+// 不会出现手势和按钮各删一次、或者点了没反应的情况
+@interface A11yDelButton : UIButton
+@end
+
+@implementation A11yDelButton
+- (BOOL)accessibilityActivate {
+    [[A11yDel shared] tap:nil];
+    return YES;
+}
+@end
 static char kDumpDone;
 
 static BOOL IsSingleDigitText(NSString *t) {
@@ -952,7 +1033,7 @@ static void ConfigureDeleteControl(UIView *v) {
 
     // 手指点击只允许走一条路径：在原生删除按钮上盖一层透明按钮，原生收不到 touch，
     // 从根本上消除「点一次删两位」。
-    UIButton *cover = [UIButton buttonWithType:UIButtonTypeCustom];
+    A11yDelButton *cover = (A11yDelButton *)[A11yDelButton buttonWithType:UIButtonTypeCustom];
     cover.frame = v.bounds;
     cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     cover.backgroundColor = [UIColor clearColor];
@@ -1748,6 +1829,8 @@ __attribute__((constructor)) static void A11yInit(void) {
     InstallTextHook(UILabel_, &gOrigSetText, (IMP)HookSetText, "setText:");
     InstallTextHook(UILabel_, &gOrigSetAttrText, (IMP)HookSetAttrText, "setAttributedText:");
     InstallTextHook(UITextField_, &gOrigTFSetText, (IMP)HookTFSetText, "setText:");
+    InstallTextHook(UITextField_, &gOrigInsertText, (IMP)HookInsertText, "insertText:");
+    InstallTextHook(UITextField_, &gOrigReplaceRange, (IMP)HookReplaceRange, "replaceRange:withText:");
     Class UITextView_ = objc_getClass("UITextView");
     InstallTextHook(UITextView_, &gOrigTVSetText, (IMP)HookTVSetText, "setText:");
     InstallTextHook(UITextView_, &gOrigTVSetAttrText, (IMP)HookTVSetAttrText, "setAttributedText:");
@@ -1765,7 +1848,7 @@ __attribute__((constructor)) static void A11yInit(void) {
     gFooterReused = NO;
 
     // 加载探针：无论日志开关是否打开，都写一个标记文件；但「无障碍补丁已加载」只播报第一次
-    NSString *boot = [NSString stringWithFormat:@"CallA11y v12 已加载 %@\n", [NSDate date]];
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v13 已加载 %@\n", [NSDate date]];
     [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
             atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     NSString *announced = [DocDir() stringByAppendingPathComponent:@"a11y_announced.txt"];
@@ -1777,7 +1860,7 @@ __attribute__((constructor)) static void A11yInit(void) {
             UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载，之后不会再提示");
         });
     }
-    A11yLog(@"CallA11y v12 载入，日志开关=%d", gLogEnabled);
+    A11yLog(@"CallA11y v13 载入，日志开关=%d", gLogEnabled);
 
     // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:3.0
@@ -1792,3 +1875,4 @@ __attribute__((constructor)) static void A11yInit(void) {
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
 }
+
