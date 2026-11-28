@@ -909,7 +909,7 @@ static void WriteDialV10(UIView *root, NSString *text, int depth) {
     } else if ([root isKindOfClass:[UILabel class]] && InDialerArea(root)) {
         UILabel *l = (UILabel *)root;
         NSString *cur = l.text ? l.text : @"";
-        if ([cur length] && ![LabelLooksLikeNumber(l)]) {
+        if ([cur length] && !LabelLooksLikeNumber(l)) {
             // 不是号码样子的 label（比如「会员 235 号…下一行」）不动
         } else {
             ((void (*)(id, SEL, NSString *))gOrigSetText)((id)root, @selector(setText:), text);
