@@ -124,6 +124,8 @@ static NSString *gLastDial = nil;
 static UITextField *gDialField = nil;
 static NSString *gUserTyped = nil;   // 用户自己敲进去的数字，用来识别 App 的自动补全
 static BOOL gAllowFullFill = NO;     // 用户主动选号（点候选）时放行一次完整号码
+static NSTimeInterval gLastAccept = 0;   // 上一次接受按键的时间，用来识别「一位一位瞬间连写」的填号
+static BOOL NumberIsKnown(NSString *d);
 
 static BOOL LooksLikeDial(id obj) {
     if (![obj isKindOfClass:[NSString class]]) return NO;
@@ -732,6 +734,16 @@ static void HookTFSetText(id self, SEL cmd, NSString *text) {
         why = @"跳变填充";
     }
 
+    // 防填号一：一次写上来的就是通讯录里的完整号码，直接不认
+    if (ok && curD.length < 7 && newD.length >= 7 && NumberIsKnown(newD)) {
+        ok = NO; why = @"命中候选整号";
+    }
+    // 防填号二：App 把整号拆成一位一位连着写，间隔几乎为零；手打不可能这么密
+    if (ok && newD.length == curD.length + 1 && curD.length < 7) {
+        NSTimeInterval nowTs = [NSDate timeIntervalSinceReferenceDate];
+        if (gLastAccept > 0 && nowTs - gLastAccept < 0.16) { ok = NO; why = @"瞬时追加"; }
+    }
+
     if (!ok) {
         // App 想往框里塞完整号码/历史号码：直接回滚成用户敲的内容
         if (![f.text isEqualToString:curD]) {
@@ -750,6 +762,7 @@ static void HookTFSetText(id self, SEL cmd, NSString *text) {
     gUserTyped = newD;
     gLastDial = newD;
     gDialField = f;
+    gLastAccept = [NSDate timeIntervalSinceReferenceDate];
     A11yLog(@"拨号文本：%@", newD);
     if (![rawD isEqualToString:newD]) {
         A11yLog(@"去掉自动补的前缀：%@ -> %@", text, newD);
@@ -764,6 +777,22 @@ static void InstallTextHook(Class cls, IMP *slot, IMP hook, const char *selName)
     Method m = class_getInstanceMethod(cls, NSSelectorFromString([NSString stringWithUTF8String:selName]));
     if (!m) return;
     *slot = method_setImplementation(m, hook);
+}
+
+// 拨号区同时存在两个输入框（PHLCDViewTextField 负责显示，ZSKeyPadView 里那个给 T9 用），
+// 只改 gDialField 会出现「点一下没反应、点第二下才少一位」的错觉，所以两个一起写。
+static void WriteDialFieldText(UIView *root, NSString *text, int depth) {
+    if (!root || depth > 16) return;
+    if ([root isKindOfClass:[UITextField class]] && InDialerArea(root)) {
+        ((void (*)(id, SEL, NSString *))gOrigTFSetText)((id)root, @selector(setText:), text);
+        return;
+    }
+    for (UIView *s in root.subviews) WriteDialFieldText(s, text, depth + 1);
+}
+
+static void WriteDialAll(NSString *text) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) WriteDialFieldText(w, text, 0);
+    if (gDialField) [gDialField sendActionsForControlEvents:UIControlEventEditingChanged];
 }
 
 @interface A11yDel : NSObject
@@ -796,9 +825,7 @@ static void InstallTextHook(Class cls, IMP *slot, IMP hook, const char *selName)
     NSString *after = [cur substringToIndex:cur.length - 1];
     if (f) {
         // 绕过 setText 的补全拦截，直接写回，保证一次点击只减一位
-        if (gOrigTFSetText)
-            ((void (*)(id, SEL, NSString *))gOrigTFSetText)((id)f, @selector(setText:), after);
-        [f sendActionsForControlEvents:UIControlEventEditingChanged];
+        WriteDialAll(after);
     }
     gLastDial = after;
     gUserTyped = DigitsOnly(after);
@@ -814,8 +841,7 @@ static void InstallTextHook(Class cls, IMP *slot, IMP hook, const char *selName)
     if (g.state != UIGestureRecognizerStateBegan) return;
     UITextField *f = gDialField;
     if (f) {
-        f.text = @"";
-        [f sendActionsForControlEvents:UIControlEventEditingChanged];
+        WriteDialAll(@"");
     }
     gLastDial = @"";
     EnqueueAnnounce(@"号码已全部清空");
@@ -1172,6 +1198,15 @@ static NSArray *MatchCandidates(NSString *typed) {
         if (T9Contains(c[@"digits"], q) || T9Contains(c[@"t9"], q)) [out addObject:c];
     }
     return out;
+}
+
+static BOOL NumberIsKnown(NSString *d) {
+    if (d.length < 7) return NO;
+    if (!gContactsLoaded || !gContacts) return NO;
+    for (NSDictionary *c in gContacts) {
+        if ([c[@"digits"] isEqualToString:d]) return YES;
+    }
+    return NO;
 }
 
 static void RemoveBar(void) {
@@ -1730,7 +1765,7 @@ __attribute__((constructor)) static void A11yInit(void) {
     gFooterReused = NO;
 
     // 加载探针：无论日志开关是否打开，都写一个标记文件；但「无障碍补丁已加载」只播报第一次
-    NSString *boot = [NSString stringWithFormat:@"CallA11y v11 已加载 %@\n", [NSDate date]];
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v12 已加载 %@\n", [NSDate date]];
     [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
             atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     NSString *announced = [DocDir() stringByAppendingPathComponent:@"a11y_announced.txt"];
@@ -1742,7 +1777,7 @@ __attribute__((constructor)) static void A11yInit(void) {
             UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载，之后不会再提示");
         });
     }
-    A11yLog(@"CallA11y v11 载入，日志开关=%d", gLogEnabled);
+    A11yLog(@"CallA11y v12 载入，日志开关=%d", gLogEnabled);
 
     // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:3.0
