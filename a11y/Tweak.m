@@ -1093,10 +1093,15 @@ static void AttachPadTaps(void) {
     return s;
 }
 
-- (void)tap:(id)g {
+- (void)tapUp:(id)g          { [self doDelete:@"抬手"]; }
+- (void)tapGesture:(id)g     { [self doDelete:@"手势"]; }
+- (void)tap:(id)g            { [self doDelete:@"激活"]; }
+
+- (void)doDelete:(NSString *)src {
     static NSTimeInterval lastDel = 0;
     NSTimeInterval nowTs = [NSDate timeIntervalSinceReferenceDate];
-    if (nowTs - lastDel < 0.35) return;   // 单击手势与按钮事件可能同时到达，去抖保证一次只删一位
+    A11yLog(@"删除入口=%@", src);
+    if (nowTs - lastDel < 0.35) return;   // 多入口可能同时到达，去抖保证一次只删一位
     lastDel = nowTs;
     UITextField *f = DialDisplayField();
     if (!f) f = gDialField;
@@ -1257,15 +1262,16 @@ static void ConfigureDeleteControl(UIView *v) {
     // 和系统电话删除键的体感一致
     cover.accessibilityTraits = UIAccessibilityTraitButton | UIAccessibilityTraitAllowsDirectInteraction;
     cover.isAccessibilityElement = YES;
-    [cover addTarget:[A11yDel shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
-    // 原生电话按下的瞬间就删一位；这里补一条按下即删，抬手那一份会被去抖吃掉
-    [cover addTarget:[A11yDel shared] action:@selector(tap:) forControlEvents:UIControlEventTouchDown];
-    UITapGestureRecognizer *ct = [[UITapGestureRecognizer alloc] initWithTarget:[A11yDel shared] action:@selector(tap:)];
+    // v11：只在「抬手」这一下删一位。按下不算，避免按住不放被当成连删；
+    // 长按阈值提到 1.5 秒，正常抬手不会误触发全清
+    [cover addTarget:[A11yDel shared] action:@selector(tapUp:) forControlEvents:UIControlEventTouchUpInside];
+    UITapGestureRecognizer *ct = [[UITapGestureRecognizer alloc] initWithTarget:[A11yDel shared] action:@selector(tapGesture:)];
+    ct.cancelsTouchesInView = NO;
     [cover addGestureRecognizer:ct];
 
     UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
         initWithTarget:[A11yDel shared] action:@selector(longPress:)];
-    lp.minimumPressDuration = 0.7;
+    lp.minimumPressDuration = 1.5;
     lp.cancelsTouchesInView = YES;
     [cover addGestureRecognizer:lp];
 
@@ -2067,7 +2073,7 @@ __attribute__((constructor)) static void A11yInit(void) {
     gFooterReused = NO;
 
     // 加载探针：无论日志开关是否打开，都写一个标记文件；但「无障碍补丁已加载」只播报第一次
-    NSString *boot = [NSString stringWithFormat:@"CallA11y v14 已加载 %@\n", [NSDate date]];
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v15 已加载 %@\n", [NSDate date]];
     [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
             atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     NSString *announced = [DocDir() stringByAppendingPathComponent:@"a11y_announced.txt"];
@@ -2079,14 +2085,13 @@ __attribute__((constructor)) static void A11yInit(void) {
             UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载，之后不会再提示");
         });
     }
-    A11yLog(@"CallA11y v14 载入，日志开关=%d", gLogEnabled);
+    A11yLog(@"CallA11y v15 载入，日志开关=%d", gLogEnabled);
 
     // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:3.0
                                                      repeats:YES
                                                        block:^(NSTimer *t) {
         ScanDelete(KeyWindowNow());
-        AttachPadTaps();
         AttachSettingsEntries();
         AttachFloatingEntries();
         AttachBlacklistButton();
