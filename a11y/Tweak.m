@@ -172,6 +172,85 @@ static NSString *LongestDigits(NSString *s, NSUInteger minLen) {
     return best;
 }
 
+// ==================== 日志 ====================
+static NSString *DocDir(void) {
+    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return dirs.count ? dirs[0] : NSTemporaryDirectory();
+}
+
+static BOOL gLogEnabled = NO;      // 默认关闭，设置页「日志」里可打开
+static NSObject *gLogLock = nil;
+
+static NSString *LogPathNow(void) {
+    return [DocDir() stringByAppendingPathComponent:@"a11y.log"];
+}
+
+static void LoadLogPref(void) {
+    gLogEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"a11y.logEnabled"];
+}
+
+static void SaveLogPref(void) {
+    [[NSUserDefaults standardUserDefaults] setBool:gLogEnabled forKey:@"a11y.logEnabled"];
+}
+
+static void A11yLog(NSString *fmt, ...) {
+    if (!gLogEnabled) return;
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (msg.length == 0) return;
+    static NSDateFormatter *df = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"HH:mm:ss.SSS";
+    });
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+
+    if (!gLogLock) gLogLock = [[NSObject alloc] init];
+    @synchronized (gLogLock) {
+        NSString *p = LogPathNow();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *at = [fm attributesOfItemAtPath:p error:NULL];
+        if (at && [[at objectForKey:NSFileSize] unsignedLongLongValue] > 262144) {
+            [fm removeItemAtPath:[p stringByAppendingString:@".1"] error:NULL];
+            [fm moveItemAtPath:p toPath:[p stringByAppendingString:@".1"] error:NULL];
+            at = nil;
+        }
+        if (!at) {
+            [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            return;
+        }
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) return;
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        } @catch (NSException *e) {}
+        [fh closeFile];
+    }
+}
+
+static NSArray *LogFiles(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *all = [fm contentsOfDirectoryAtPath:DocDir() error:NULL];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *n in all) {
+        if (![n hasPrefix:@"a11y"]) continue;
+        if (!([n hasSuffix:@".log"] || [n hasSuffix:@".log.1"] || [n hasSuffix:@".txt"])) continue;
+        NSString *p = [DocDir() stringByAppendingPathComponent:n];
+        NSDictionary *at = [fm attributesOfItemAtPath:p error:NULL];
+        NSNumber *size = at ? [at objectForKey:NSFileSize] : @0;
+        NSDate *mod = at ? [at objectForKey:NSFileModificationDate] : nil;
+        [out addObject:@{@"name": n, @"path": p, @"size": size, @"mod": mod ?: [NSDate date]}];
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"mod"] compare:a[@"mod"]];
+    }];
+    return out;
+}
+
 @interface A11yAction : UIAccessibilityCustomAction
 @property (nonatomic, copy) NSString *digits;
 @property (nonatomic, assign) NSInteger kind;
@@ -180,11 +259,215 @@ static NSString *LongestDigits(NSString *s, NSUInteger minLen) {
 @implementation A11yAction
 @end
 
+// 日志页用的自定义动作（带文件路径，避免被黑名单动作 hook 干扰）
+@interface A11yFileAction : UIAccessibilityCustomAction
+@property (nonatomic, copy) NSString *path;
+@end
+
+@implementation A11yFileAction
+@end
+
+static NSString *WriteDumpNow(UIWindow *win);
+
+@interface A11yLogVC : UITableViewController
+@property (nonatomic, strong) NSMutableArray *files;
+@end
+
+@implementation A11yLogVC
+
+- (instancetype)init {
+    self = [super initWithStyle:UITableViewStyleGrouped];
+    if (self) self.title = @"日志";
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                      target:self action:@selector(closeSelf)];
+    [self reloadFiles];
+}
+
+- (void)closeSelf { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)reloadFiles {
+    self.files = [LogFiles() mutableCopy];
+    [self.tableView reloadData];
+}
+
+- (NSString *)sizeText:(NSNumber *)n {
+    double b = n ? n.doubleValue : 0;
+    if (b < 1024) return [NSString stringWithFormat:@"%.0f 字节", b];
+    if (b < 1048576) return [NSString stringWithFormat:@"%.1f KB", b / 1024.0];
+    return [NSString stringWithFormat:@"%.1f MB", b / 1048576.0];
+}
+
+- (void)switchChanged:(UISwitch *)sw {
+    gLogEnabled = sw.on;
+    SaveLogPref();
+    EnqueueAnnounce(sw.on ? @"已开启，日志开始记录" : @"已关闭，日志停止记录");
+    if (sw.on) A11yLog(@"日志开关：开启");
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return 3; }
+
+- (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s {
+    if (s == 0) return @"开关";
+    if (s == 1) return @"日志文件";
+    return @"操作";
+}
+
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s {
+    if (s == 0) return 1;
+    if (s == 1) return (NSInteger)self.files.count;
+    return 3;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
+    static NSString *cid = @"logcell";
+    UITableViewCell *cell = [t dequeueReusableCellWithIdentifier:cid];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
+    cell.accessoryView = nil;
+    cell.accessibilityCustomActions = nil;
+    cell.accessibilityHint = nil;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    cell.accessibilityTraits = UIAccessibilityTraitButton;
+    cell.accessibilityLabel = nil;
+
+    if (ip.section == 0) {
+        cell.textLabel.text = @"记录日志";
+        cell.detailTextLabel.text = @"关闭时不写日志，不影响使用";
+        cell.accessibilityLabel = @"记录日志";
+        cell.accessibilityTraits = UIAccessibilityTraitNone;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        UISwitch *sw = [[UISwitch alloc] init];
+        sw.on = gLogEnabled;
+        sw.accessibilityLabel = @"记录日志";
+        [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = sw;
+        return cell;
+    }
+
+    if (ip.section == 1) {
+        NSDictionary *f = self.files[(NSUInteger)ip.row];
+        NSString *size = [self sizeText:f[@"size"]];
+        cell.textLabel.text = f[@"name"];
+        cell.detailTextLabel.text = size;
+        cell.accessibilityLabel = [NSString stringWithFormat:@"%@ %@", f[@"name"], size];
+        cell.accessibilityHint = @"双击分享";
+        A11yFileAction *a = [[A11yFileAction alloc] initWithName:@"删除日志"
+                                                          target:self
+                                                        selector:@selector(deleteFileAction:)];
+        a.path = f[@"path"];
+        cell.accessibilityCustomActions = @[a];
+        return cell;
+    }
+
+    if (ip.row == 0) {
+        cell.textLabel.text = @"发送全部日志";
+        cell.accessibilityLabel = @"发送全部日志";
+    } else if (ip.row == 1) {
+        cell.textLabel.text = @"清空全部日志";
+        cell.textLabel.textColor = [UIColor systemRedColor];
+        cell.accessibilityLabel = @"清空全部日志";
+    } else {
+        cell.textLabel.text = @"生成界面快照";
+        cell.detailTextLabel.text = @"记录当前界面控件结构，排查用";
+        cell.accessibilityLabel = @"生成界面快照";
+    }
+    return cell;
+}
+
+- (void)fileURLs:(NSArray *)files completion:(void (^)(NSArray *))done {
+    NSMutableArray *urls = [NSMutableArray array];
+    for (NSDictionary *f in files) {
+        NSString *p = f[@"path"];
+        if (p && [[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            [urls addObject:[NSURL fileURLWithPath:p]];
+        }
+    }
+    done(urls);
+}
+
+- (void)shareFiles:(NSArray *)files cell:(UITableViewCell *)cell {
+    if (files.count == 0) {
+        EnqueueAnnounce(@"没有可发送的日志");
+        return;
+    }
+    [self fileURLs:files completion:^(NSArray *urls) {
+        if (urls.count == 0) { EnqueueAnnounce(@"没有可发送的日志"); return; }
+        UIActivityViewController *avc =
+            [[UIActivityViewController alloc] initWithActivityItems:urls applicationActivities:nil];
+        avc.popoverPresentationController.sourceView = cell ?: self.view;
+        avc.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
+        [self presentViewController:avc animated:YES completion:nil];
+        A11yLog(@"发送日志 %lu 个", (unsigned long)urls.count);
+    }];
+}
+
+- (void)deleteFileAction:(A11yFileAction *)a {
+    NSString *path = a.path;
+    if (path.length == 0) return;
+    [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+    [self reloadFiles];
+    EnqueueAnnounce([NSString stringWithFormat:@"已删除日志 %@", [path lastPathComponent]]);
+}
+
+- (void)deleteFileAt:(NSIndexPath *)ip {
+    if (ip.row >= (NSInteger)self.files.count) return;
+    NSDictionary *f = self.files[(NSUInteger)ip.row];
+    [[NSFileManager defaultManager] removeItemAtPath:f[@"path"] error:NULL];
+    [self.files removeObjectAtIndex:(NSUInteger)ip.row];
+    [self.tableView deleteRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationFade];
+    EnqueueAnnounce([NSString stringWithFormat:@"已删除日志 %@", f[@"name"]]);
+}
+
+- (void)clearAll {
+    for (NSDictionary *f in self.files) {
+        [[NSFileManager defaultManager] removeItemAtPath:f[@"path"] error:NULL];
+    }
+    [self reloadFiles];
+    EnqueueAnnounce(@"日志已全部清空");
+}
+
+- (void)makeSnapshot {
+    NSString *p = WriteDumpNow(KeyWindowNow());
+    [self reloadFiles];
+    EnqueueAnnounce(p.length ? @"界面快照已生成" : @"快照生成失败");
+}
+
+- (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [t deselectRowAtIndexPath:ip animated:YES];
+    if (ip.section == 0) return;
+    UITableViewCell *cell = [t cellForRowAtIndexPath:ip];
+    if (ip.section == 1) {
+        if (ip.row < (NSInteger)self.files.count) [self shareFiles:@[self.files[(NSUInteger)ip.row]] cell:cell];
+        return;
+    }
+    if (ip.row == 0) [self shareFiles:self.files cell:cell];
+    else if (ip.row == 1) [self clearAll];
+    else [self makeSnapshot];
+}
+
+- (void)tableView:(UITableView *)t commitEditingStyle:(UITableViewCellEditingStyle)s
+ forRowAtIndexPath:(NSIndexPath *)ip {
+    if (s == UITableViewCellEditingStyleDelete && ip.section == 1) [self deleteFileAt:ip];
+}
+
+- (UITableViewCellEditingStyle)tableView:(UITableView *)t editingStyleForRowAtIndexPath:(NSIndexPath *)ip {
+    return ip.section == 1 ? UITableViewCellEditingStyleDelete : UITableViewCellEditingStyleNone;
+}
+
+@end
+
 @interface A11yHelper : NSObject
 + (instancetype)shared;
 - (BOOL)handleAction:(UIAccessibilityCustomAction *)action;
 - (void)tapCandidate:(UIButton *)sender;
 - (void)openBlacklist;
+- (void)openLogs;
+- (void)tapOpenLogs:(id)sender;
 @end
 
 @interface A11yBlackVC : UITableViewController
@@ -243,10 +526,12 @@ static NSString *LongestDigits(NSString *s, NSUInteger minLen) {
     if (a.kind == 0) {
         if (![gBlacklist containsObject:digits]) [gBlacklist addObject:digits];
         SaveBlacklist();
+        A11yLog(@"加入黑名单 %@，现有 %lu 条", digits, (unsigned long)gBlacklist.count);
         EnqueueAnnounce([NSString stringWithFormat:@"已加入黑名单 %@", digits]);
     } else {
         [gBlacklist removeObject:digits];
         SaveBlacklist();
+        A11yLog(@"移出黑名单 %@，现有 %lu 条", digits, (unsigned long)gBlacklist.count);
         EnqueueAnnounce([NSString stringWithFormat:@"已移出黑名单 %@", digits]);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -271,17 +556,28 @@ static NSString *LongestDigits(NSString *s, NSUInteger minLen) {
     }
 }
 
-- (void)openBlacklist {
+- (void)presentModal:(UIViewController *)vc {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *top = KeyWindowNow().rootViewController;
         while (top.presentedViewController) top = top.presentedViewController;
         if ([top isKindOfClass:[UINavigationController class]])
             top = ((UINavigationController *)top).topViewController;
         if (!top) return;
-        A11yBlackVC *vc = [[A11yBlackVC alloc] init];
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
         [top presentViewController:nav animated:YES completion:nil];
     });
+}
+
+- (void)openBlacklist {
+    [self presentModal:[[A11yBlackVC alloc] init]];
+}
+
+- (void)openLogs {
+    [self presentModal:[[A11yLogVC alloc] init]];
+}
+
+- (void)tapOpenLogs:(id)sender {
+    [self openLogs];
 }
 
 @end
@@ -294,7 +590,19 @@ static void TrackDial(id self, NSString *text) {
     if (!LooksLikeDial(text) || text.length == 0) return;
     gLastDial = text;
     if ([self isKindOfClass:[UITextField class]]) gDialField = (UITextField *)self;
+    A11yLog(@"拨号文本：%@（字段=%@）", text, [self isKindOfClass:[UITextField class]] ? @"UITextField" : NSStringFromClass([self class]));
     RefreshBarFor(text);
+}
+
+static BOOL gFooterReused = NO;
+
+static BOOL IsFooterEnglish(NSString *s) {
+    if (![s isKindOfClass:[NSString class]]) return NO;
+    NSString *l = [s lowercaseString];
+    if ([l rangeOfString:@"update address"].location != NSNotFound) return YES;
+    if ([l rangeOfString:@"free and will not charge"].location != NSNotFound) return YES;
+    if ([l rangeOfString:@"be cheated"].location != NSNotFound) return YES;
+    return NO;
 }
 
 static void HookSetText(id self, SEL cmd, NSString *text) {
@@ -302,7 +610,22 @@ static void HookSetText(id self, SEL cmd, NSString *text) {
     if ([t isKindOfClass:[NSString class]]) {
         TrackDial(self, t);
         if ([self isKindOfClass:[UIView class]] && InSettingsArea((UIView *)self)) {
-            t = FilterEnglish(t);
+            if (!gFooterReused && IsFooterEnglish(t)) {
+                // 复用原来页脚那几行英文的焦点，改成「无障碍日志」入口
+                gFooterReused = YES;
+                UIView *v = (UIView *)self;
+                v.userInteractionEnabled = YES;
+                v.isAccessibilityElement = YES;
+                v.accessibilityLabel = @"无障碍日志";
+                v.accessibilityTraits = UIAccessibilityTraitButton;
+                UITapGestureRecognizer *gt =
+                    [[UITapGestureRecognizer alloc] initWithTarget:[A11yHelper shared] action:@selector(tapOpenLogs:)];
+                [v addGestureRecognizer:gt];
+                t = @"无障碍日志";
+                A11yLog(@"页脚英文改为无障碍日志入口");
+            } else {
+                t = FilterEnglish(t);
+            }
         }
     }
     ((void (*)(id, SEL, NSString *))gOrigSetText)(self, cmd, t);
@@ -477,12 +800,21 @@ static void ScanDelete(UIWindow *win) {
     if (!win) return;
     gDelControl = nil;
     ScanDeleteAt(win, 0);
+    BOOL byGeom = NO;
     if (!gDelControl && LooksLikeDialPad(win)) {
         UIView *g = FindGeometricDelete(win, win.bounds, 0, nil);
         if (g) {
             gDelControl = g;
+            byGeom = YES;
             ConfigureDeleteControl(g);
         }
+    }
+    if (gDelControl) {
+        A11yLog(@"删除键命中：%@ frame=%@ 方式=%@", NSStringFromClass([gDelControl class]),
+                NSStringFromCGRect([gDelControl convertRect:gDelControl.bounds toView:nil]),
+                byGeom ? @"几何兜底" : @"标签");
+    } else {
+        A11yLog(@"删除键未命中，拨号盘判定=%d", LooksLikeDialPad(win));
     }
 }
 
@@ -495,16 +827,22 @@ static NSString *DescribeTree(UIView *v, int depth, int maxDepth) {
     return s;
 }
 
+static NSString *WriteDumpNow(UIWindow *win) {
+    if (!win) return nil;
+    NSString *tree = DescribeTree(win, 0, 10);
+    NSString *p = [DocDir() stringByAppendingPathComponent:@"a11y_dump.txt"];
+    BOOL ok = [tree writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    A11yLog(@"界面快照 %@ 写入%@", NSStringFromCGSize(win.bounds.size), ok ? @"成功" : @"失败");
+    return ok ? p : nil;
+}
+
 static void DumpOnce(UIWindow *win) {
     if (objc_getAssociatedObject(win, &kDumpDone)) return;
     objc_setAssociatedObject(win, &kDumpDone, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!gLogEnabled) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        NSString *tree = DescribeTree(win, 0, 8);
-        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *p = [[dirs.firstObject ?: NSTemporaryDirectory()
-                        stringByAppendingPathComponent:@"a11y_dump.txt"] copy];
-        [tree writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        WriteDumpNow(win);
     });
 }
 
@@ -527,6 +865,7 @@ static NSArray *HookCustomActions(id self, SEL cmd) {
     NSMutableArray *arr = base ? [base mutableCopy] : [NSMutableArray array];
     for (UIAccessibilityCustomAction *a in arr) {
         if ([a isKindOfClass:[A11yAction class]]) return arr;
+        if ([a isKindOfClass:[A11yFileAction class]]) return arr;
     }
     A11yAction *act = nil;
     if (inBlackVC || [gBlacklist containsObject:digits]) {
@@ -598,7 +937,7 @@ static void LoadContactsIfNeeded(void) {
     CNContactStore *store = [[CNContactStore alloc] init];
     [store requestAccessForEntityType:CNEntityTypeContacts
                      completionHandler:^(BOOL granted, NSError *err) {
-        if (!granted) { gContactsLoading = NO; return; }
+        if (!granted) { gContactsLoading = NO; A11yLog(@"通讯录未授权"); return; }
         NSArray *keys = @[CNContactGivenNameKey, CNContactFamilyNameKey,
                           CNContactPhoneNumbersKey, CNContactOrganizationNameKey];
         NSMutableArray *list = [NSMutableArray array];
@@ -621,6 +960,7 @@ static void LoadContactsIfNeeded(void) {
         gContacts = list;
         gContactsLoaded = YES;
         gContactsLoading = NO;
+        A11yLog(@"通讯录载入 %lu 个号码", (unsigned long)list.count);
         dispatch_async(dispatch_get_main_queue(), ^{
             gBarKey = nil;
             if (gLastDial) RefreshBarFor(gLastDial);
@@ -659,6 +999,8 @@ static void RefreshBarFor(NSString *typed) {
         if (q.length < 3) { RemoveBar(); gBarKey = nil; return; }
         if (gBarKey && [gBarKey isEqualToString:q] && gBar) return;
         NSArray *cands = MatchCandidates(q);
+        A11yLog(@"候选刷新 输入=%@ 命中=%lu 条 联系人库=%lu", q, (unsigned long)cands.count,
+                (unsigned long)gContacts.count);
         if (cands.count == 0 && !gBar) return;
         gBarKey = q;
 
@@ -713,7 +1055,7 @@ static void RefreshBarFor(NSString *typed) {
     });
 }
 
-static void AttachBlacklistEntry(void) {
+static void AttachSettingsEntries(void) {
     UIWindow *win = KeyWindowNow();
     UIViewController *top = win.rootViewController;
     if (!top) return;
@@ -723,13 +1065,37 @@ static void AttachBlacklistEntry(void) {
     UIViewController *vc = nav.topViewController;
     NSString *name = NSStringFromClass([vc class]);
     if ([name rangeOfString:@"Set" options:NSCaseInsensitiveSearch].location == NSNotFound) return;
-    if ([nav.navigationItem.rightBarButtonItem.accessibilityLabel isEqualToString:@"黑名单"]) return;
-    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:@"黑名单"
-                                                            style:UIBarButtonItemStylePlain
-                                                           target:[A11yHelper shared]
-                                                           action:@selector(openBlacklist)];
-    item.accessibilityLabel = @"黑名单";
-    [nav.navigationItem setRightBarButtonItem:item animated:NO];
+
+    UIBarButtonItem *blk = nil, *logs = nil;
+    for (UIBarButtonItem *it in nav.navigationItem.rightBarButtonItems) {
+        NSString *l = it.accessibilityLabel;
+        if ([l isEqualToString:@"黑名单"]) blk = it;
+        else if ([l isEqualToString:@"日志"]) logs = it;
+    }
+    if (blk && logs) return;
+
+    if (!blk) {
+        blk = [[UIBarButtonItem alloc] initWithTitle:@"黑名单"
+                                               style:UIBarButtonItemStylePlain
+                                              target:[A11yHelper shared]
+                                              action:@selector(openBlacklist)];
+        blk.accessibilityLabel = @"黑名单";
+        A11yLog(@"设置页挂上黑名单入口");
+    }
+    if (!logs) {
+        logs = [[UIBarButtonItem alloc] initWithTitle:@"日志"
+                                                style:UIBarButtonItemStylePlain
+                                               target:[A11yHelper shared]
+                                               action:@selector(openLogs)];
+        logs.accessibilityLabel = @"日志";
+        A11yLog(@"设置页挂上日志入口");
+    }
+    NSMutableArray *items = [NSMutableArray arrayWithObject:blk];
+    [items addObject:logs];
+    for (UIBarButtonItem *it in nav.navigationItem.rightBarButtonItems) {
+        if (it != blk && it != logs) [items addObject:it];
+    }
+    [nav.navigationItem setRightBarButtonItems:items animated:NO];
 }
 
 __attribute__((constructor)) static void A11yInit(void) {
@@ -746,21 +1112,24 @@ __attribute__((constructor)) static void A11yInit(void) {
     }
 
     LoadBlacklist();
+    LoadLogPref();
     LoadContactsIfNeeded();
+    gFooterReused = NO;
+    A11yLog(@"CallA11y v3 载入，日志开关=%d", gLogEnabled);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindow *w = KeyWindowNow();
         ScanDelete(w);
         DumpOnce(w);
-        AttachBlacklistEntry();
+        AttachSettingsEntries();
     });
 
     for (int i = 0; i < 10; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((1.5 + i * 1.5) * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             ScanDelete(KeyWindowNow());
-            AttachBlacklistEntry();
+            AttachSettingsEntries();
         });
     }
 }
