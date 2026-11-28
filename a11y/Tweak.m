@@ -1201,6 +1201,8 @@ static void AttachSettingsEntries(void) {
 
 // ---- v6：最近通话行加“加入黑名单”按钮 + 呼入/呼出方向播报 ----
 
+extern id UIAccessibilityFocusedUIElement(unsigned int notification);
+
 static UITableView *FindFirstTable(UIView *root, int depth) {
     if (!root || depth > 12) return nil;
     if ([root isKindOfClass:[UITableView class]]) return (UITableView *)root;
@@ -1287,7 +1289,7 @@ static void AddToBlacklistNow(NSString *digits) {
     if (!vc) return;
 
     NSString *digits = nil;
-    id focused = UIAccessibilityFocusedUIElement(UIAccessibilityScreenChangedNotification);
+    id focused = UIAccessibilityFocusedUIElement(1000);
     if (focused && [focused isKindOfClass:[UIView class]]) digits = LongestDigits(RawA11yLabel((UIView *)focused), 7);
     if (!digits) {
         UITableView *tv = FindFirstTable(vc.view, 0);
