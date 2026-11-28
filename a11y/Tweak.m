@@ -1201,7 +1201,16 @@ static void AttachSettingsEntries(void) {
 
 // ---- v6：最近通话行加“加入黑名单”按钮 + 呼入/呼出方向播报 ----
 
-extern id UIAccessibilityFocusedUIElement(unsigned int notification);
+extern void *dlsym(void *handle, const char *symbol);
+#define kRTLDDefault ((void *)-2L)
+
+// 运行时取 VoiceOver 当前焦点元素；符号不可用时返回 nil，走表格行兜底
+static id FocusedElementNow(void) {
+    static id (*fn)(unsigned int) = NULL;
+    static int tried = 0;
+    if (!tried) { tried = 1; fn = (id (*)(unsigned int))dlsym(kRTLDDefault, "UIAccessibilityFocusedUIElement"); }
+    return fn ? fn(1000) : nil;
+}
 
 static UITableView *FindFirstTable(UIView *root, int depth) {
     if (!root || depth > 12) return nil;
@@ -1289,7 +1298,7 @@ static void AddToBlacklistNow(NSString *digits) {
     if (!vc) return;
 
     NSString *digits = nil;
-    id focused = UIAccessibilityFocusedUIElement(1000);
+    id focused = FocusedElementNow();
     if (focused && [focused isKindOfClass:[UIView class]]) digits = LongestDigits(RawA11yLabel((UIView *)focused), 7);
     if (!digits) {
         UITableView *tv = FindFirstTable(vc.view, 0);
