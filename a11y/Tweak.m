@@ -67,7 +67,7 @@ static BOOL HasLatinLetter(NSString *s) {
 // 纯英文单词保留（拨号键上的 ABC、DEF 不能被清掉）；纯数字/符号串保留。
 static NSString *FilterEnglish(NSString *raw) {
     if (![raw isKindOfClass:[NSString class]] || raw.length == 0) return raw;
-    if (raw.length > 120) return raw;   // 长文本（网页/整段说明）一律不动，避免整段被清空并拖慢 UI
+    if (raw.length > 400) return raw;   // 超长文本（整段网页/日志）不动，避免误清空并拖慢 UI
     if (!HasLatinLetter(raw)) return raw;
 
     if (HasNonASCII(raw)) {
@@ -101,6 +101,7 @@ static BOOL gSpeaking = NO;
 static void DrainQueue(void);
 static void RefreshBarFor(NSString *typed);
 static UIWindow *KeyWindowNow(void);
+static NSString *CellTexts(UIView *v, int depth);
 
 static void EnqueueAnnounce(NSString *msg) {
     if (msg.length == 0) return;
@@ -615,11 +616,14 @@ static void TrackDial(id self, NSString *text) {
 
 static BOOL gFooterReused = NO;   // 保留占位，不做页脚改造
 
-static void HookSetText(id self, SEL cmd, NSString *text) {
+static IMP gOrigTVSetText = NULL;
+static IMP gOrigTVSetAttrText = NULL;
+
+static void CleanTextForward(id self, SEL cmd, NSString *text, IMP orig) {
     NSString *t = text;
     if ([t isKindOfClass:[NSString class]]) {
         TrackDial(self, t);
-        if ([self isKindOfClass:[UILabel class]]) {
+        if ([self isKindOfClass:[UILabel class]] || [self isKindOfClass:[UITextView class]]) {
             NSString *f = FilterEnglish(t);
             if (f && ![f isEqualToString:t]) {
                 A11yLog(@"英文清理：%@ -> %@", t, f);
@@ -627,12 +631,21 @@ static void HookSetText(id self, SEL cmd, NSString *text) {
             }
         }
     }
-    ((void (*)(id, SEL, NSString *))gOrigSetText)(self, cmd, t);
+    ((void (*)(id, SEL, NSString *))orig)(self, cmd, t);
 }
 
-static void HookSetAttrText(id self, SEL cmd, NSAttributedString *text) {
+static void HookSetText(id self, SEL cmd, NSString *text) {
+    CleanTextForward(self, cmd, text, gOrigSetText);
+}
+
+static void HookTVSetText(id self, SEL cmd, NSString *text) {
+    CleanTextForward(self, cmd, text, gOrigTVSetText);
+}
+
+static void CleanAttrForward(id self, SEL cmd, NSAttributedString *text, IMP orig) {
     NSAttributedString *t = text;
-    if ([t isKindOfClass:[NSAttributedString class]] && [self isKindOfClass:[UILabel class]]) {
+    if ([t isKindOfClass:[NSAttributedString class]] &&
+        ([self isKindOfClass:[UILabel class]] || [self isKindOfClass:[UITextView class]])) {
         NSString *s = t.string;
         NSString *f = FilterEnglish(s);
         if (f && ![f isEqualToString:s]) {
@@ -645,7 +658,27 @@ static void HookSetAttrText(id self, SEL cmd, NSAttributedString *text) {
                                                              NSParagraphStyleAttributeName:ps}];
         }
     }
-    ((void (*)(id, SEL, NSAttributedString *))gOrigSetAttrText)(self, cmd, t);
+    ((void (*)(id, SEL, NSAttributedString *))orig)(self, cmd, t);
+}
+
+static void HookSetAttrText(id self, SEL cmd, NSAttributedString *text) {
+    CleanAttrForward(self, cmd, text, gOrigSetAttrText);
+}
+
+static void HookTVSetAttrText(id self, SEL cmd, NSAttributedString *text) {
+    CleanAttrForward(self, cmd, text, gOrigTVSetAttrText);
+}
+
+// App 在第一次按键后会往号码前面自动塞一个 0（输 1 变成 01），用户从没敲过这个 0。
+// 只要当前已输入不是以 0 开头，就把新文本首位多出来的 0 去掉，再判断它是不是「用户敲的那一位」。
+static NSString *StripAutoZero(NSString *newD, NSString *curD) {
+    if (newD.length < 2 || ![newD hasPrefix:@"0"] || [curD hasPrefix:@"0"]) return newD;
+    NSString *rest = [newD substringFromIndex:1];
+    if ([rest isEqualToString:curD]) return rest;                                   // 只是重复写了 0
+    if (rest.length == curD.length + 1 && [rest hasPrefix:curD]) return rest;       // 敲了新的一位
+    if (rest.length + 1 == curD.length && [curD hasPrefix:rest]) return rest;       // 删了一位
+    if (curD.length == 0 && rest.length == 1) return rest;                          // 第一下按键
+    return newD;
 }
 
 static void HookTFSetText(id self, SEL cmd, NSString *text) {
@@ -655,36 +688,59 @@ static void HookTFSetText(id self, SEL cmd, NSString *text) {
         ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, text);
         return;
     }
-    NSString *newD = DigitsOnly(text);
+    UITextField *f = (UITextField *)self;
+    NSString *rawD = DigitsOnly(text);
     NSString *curD = gUserTyped ? gUserTyped : @"";
-    BOOL autoFill = NO;
-    // 用户逐位敲是 +1 位；App 的补全会一次多塞好几位，只要跳位且以已输入开头就丢弃
-    if (!gAllowFullFill && curD.length >= 1 && newD.length >= 7 &&
-        newD.length > curD.length + 1 && [newD hasPrefix:curD]) {
-        autoFill = YES;
+    NSString *newD = StripAutoZero(rawD, curD);
+
+    // 用户主动点候选选号，放行一次完整号码
+    if (gAllowFullFill) {
+        gAllowFullFill = NO;
+        gUserTyped = newD;
+        gLastDial = newD;
+        gDialField = f;
+        ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, newD);
+        RefreshBarFor(newD);
+        return;
     }
-    if (autoFill) {
-        UITextField *f = (UITextField *)self;
-        if (gOrigTFSetText && ![f.text isEqualToString:curD]) {
+
+    BOOL ok = NO;
+    NSString *why = @"";
+    if ([newD isEqualToString:curD]) {
+        ok = YES;                                 // 同一内容（格式化/非格式化两份）重复写入
+    } else if (newD.length == curD.length + 1 && [newD hasPrefix:curD]) {
+        ok = YES;                                 // 用户敲了一位
+    } else if (curD.length >= 1 && newD.length + 1 == curD.length && [curD hasPrefix:newD]) {
+        ok = YES;                                 // 用户删了一位
+    } else if (newD.length == 0) {
+        ok = YES;                                 // 清空
+    } else {
+        why = @"跳变填充";
+    }
+
+    if (!ok) {
+        // App 想往框里塞完整号码/历史号码：直接回滚成用户敲的内容
+        if (![f.text isEqualToString:curD]) {
             ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, curD);
         }
-        A11yLog(@"拦截自动补全：%@ -> 保持 %@（field=%@ 父=%@）", text, curD,
-                NSStringFromClass([f class]), NSStringFromClass([f.superview class]));
+        A11yLog(@"拦截自动填充：%@ -> 保持 %@（field=%@ 父=%@ %@）", text, curD,
+                NSStringFromClass([f class]), NSStringFromClass([f.superview class]), why);
         gLastDial = curD;
         gDialField = f;
         RefreshBarFor(curD);
         return;
     }
-    if (gAllowFullFill) {
-        gAllowFullFill = NO;
-        gUserTyped = newD;
-    } else if (newD.length > 0 && newD.length < 7) {
-        gUserTyped = newD;
-    } else if (newD.length == 0) {
-        gUserTyped = @"";
+
+    gUserTyped = newD;
+    gLastDial = newD;
+    gDialField = f;
+    A11yLog(@"拨号文本：%@", newD);
+    if (![rawD isEqualToString:newD]) {
+        A11yLog(@"去掉自动补的前缀：%@ -> %@", text, newD);
     }
-    TrackDial(self, text);
-    ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, text);
+    // 一律按干净数字写回，输入框里只留用户敲的号码
+    ((void (*)(id, SEL, NSString *))gOrigTFSetText)(self, cmd, newD);
+    RefreshBarFor(newD);
 }
 
 static void InstallTextHook(Class cls, IMP *slot, IMP hook, const char *selName) {
@@ -944,28 +1000,53 @@ static void DumpOnce(UIWindow *win) {
 
 static IMP gOrigCustomActions = NULL;
 
+static BOOL InsideTableCell(UIView *v) {
+    UIView *p = v;
+    for (int i = 0; i < 6 && p; i++, p = p.superview)
+        if ([p isKindOfClass:[UITableViewCell class]]) return YES;
+    return NO;
+}
+
+// 旁白聚焦的往往不是 cell 本身，而是行里某个子视图；所以号码要从自己、下层、上层一起找
+static NSString *DigitsNear(UIView *v) {
+    NSString *d = LongestDigits([v accessibilityLabel], 7);
+    if (!d) d = LongestDigits([v accessibilityValue], 7);
+    if (!d) d = LongestDigits(CellTexts(v, 0), 7);
+    UIView *p = v.superview;
+    for (int i = 0; i < 4 && !d && p; i++, p = p.superview)
+        d = LongestDigits(CellTexts(p, 0), 7);
+    return d;
+}
+
 static NSArray *HookCustomActions(id self, SEL cmd) {
     NSArray *base = ((NSArray *(*)(id, SEL))gOrigCustomActions)(self, cmd);
     if (![self isKindOfClass:[UIView class]]) return base;
     UIView *v = (UIView *)self;
-    NSString *label = [v accessibilityLabel];
-    if (!label.length) label = [v accessibilityValue];
-    NSString *digits = LongestDigits(label, 7);
+
+    for (UIAccessibilityCustomAction *a in base) {
+        if ([a isKindOfClass:[A11yAction class]]) return base;
+        if ([a isKindOfClass:[A11yFileAction class]]) return base;
+    }
+
+    NSString *vcName = NearestVCName(v);
+    BOOL inBlackVC = (vcName && [vcName isEqualToString:@"A11yBlackVC"]);
+    if (!inBlackVC) {
+        if (!InsideTableCell(v)) return base;
+        // 只给旁白真正会聚焦的元素挂，避免整行每个子视图都多出一条
+        BOOL focusable = v.isAccessibilityElement ||
+                         ([v accessibilityLabel].length > 0) ||
+                         (([v accessibilityTraits] & UIAccessibilityTraitButton) != 0);
+        if (!focusable) return base;
+    }
+
+    NSString *digits = DigitsNear(v);
     if (!digits) return base;
 
     LoadBlacklist();
-    BOOL inBlackVC = NO;
-    NSString *vcName = NearestVCName(v);
-    if (vcName && [vcName isEqualToString:@"A11yBlackVC"]) inBlackVC = YES;
-
     NSMutableArray *arr = base ? [base mutableCopy] : [NSMutableArray array];
-    for (UIAccessibilityCustomAction *a in arr) {
-        if ([a isKindOfClass:[A11yAction class]]) return arr;
-        if ([a isKindOfClass:[A11yFileAction class]]) return arr;
-    }
     A11yAction *act = nil;
-    if (inBlackVC || [gBlacklist containsObject:digits]) {
-        act = [[A11yAction alloc] initWithName:@"删除"
+    if (inBlackVC || (gBlacklist && [gBlacklist containsObject:digits])) {
+        act = [[A11yAction alloc] initWithName:@"移出黑名单"
                                        target:[A11yHelper shared]
                                      selector:@selector(handleAction:)];
         act.kind = 1;
@@ -1105,10 +1186,11 @@ static void RefreshBarFor(NSString *typed) {
         }
         gBarKey = q;
 
-        // App 有多个 window，用 keyWindow 会把条加到别的层上，界面上就看不见
+        // App 有自己的视图层级和重排逻辑，挂在 rootViewController.view 上会被它的视图盖住/被重排带走；
+        // 直接挂到 window 本身，window 的子视图永远在所有控制器视图之上。
         UIWindow *win = gDialField.window ? gDialField.window : KeyWindowNow();
         if (!win) return;
-        UIView *host = win.rootViewController.view ? win.rootViewController.view : win;
+        UIView *host = win;
 
         CGFloat h = 44;
         CGFloat y = host.bounds.size.height - 320;
@@ -1440,10 +1522,10 @@ static BOOL IsRecentCallsPage(UIView *root) {
     if (tb && tb.selectedItem) {
         NSString *t = tb.selectedItem.title;
         if (!t.length) t = tb.selectedItem.accessibilityLabel;
-        if (t.length && [t rangeOfString:@"最近"].location != NSNotFound) return YES;
+        if (t.length) return [t rangeOfString:@"最近"].location != NSNotFound;
     }
-    // 拨号盘以外的列表页一律允许挂：最近通话是主战场，通讯录也能顺手加
-    return YES;
+    // 找不到底部标签栏时不再“一律允许”，否则按钮会跑到拨号盘上
+    return NO;
 }
 
 static void RemoveBlkBtn(void) {
@@ -1553,12 +1635,57 @@ static void AttachCellActions(void) {
     }
 }
 
+ // 设置页兜底清理：有些说明文字是页面构建时就写死的（早于钩子安装），或者走富文本/自定义绘制，
+ // 光靠 setText 钩子抓不到。这里每分钟扫一遍设置页可见控件，把残留英文再清一次。
+static void CleanTextSweep(UIView *v, int depth) {
+    if (!v || depth > 14) return;
+    BOOL hidden = v.isHidden || v.alpha < 0.01;
+    if (!hidden) {
+        NSString *t = nil;
+        BOOL isLab = [v isKindOfClass:[UILabel class]];
+        BOOL isTV = [v isKindOfClass:[UITextView class]];
+        if (isLab) t = ((UILabel *)v).text;
+        else if (isTV) t = ((UITextView *)v).text;
+        if (t.length && t.length <= 400) {
+            NSString *f = FilterEnglish(t);
+            if (f && ![f isEqualToString:t]) {
+                if (isLab) ((UILabel *)v).text = f;
+                else ((UITextView *)v).text = f;
+                A11yLog(@"英文清理(兜底)：%@ -> %@", t, f);
+            }
+        }
+        if ([v isKindOfClass:[UIButton class]]) {
+            NSString *f = FilterEnglish(((UIButton *)v).currentTitle);
+            if (f && ![f isEqualToString:((UIButton *)v).currentTitle]) {
+                [(UIButton *)v setTitle:f forState:UIControlStateNormal];
+            }
+        }
+    }
+    for (UIView *s in v.subviews) CleanTextSweep(s, depth + 1);
+}
+
+static void SweepSettingsIfNeeded(void) {
+    UIWindow *win = KeyWindowNow();
+    if (!win) return;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if ([top isKindOfClass:[UINavigationController class]])
+        top = ((UINavigationController *)top).topViewController;
+    UIView *root = top.view;
+    if (!root) return;
+    if (!LooksLikeSettings(root, 0)) return;
+    CleanTextSweep(root, 0);
+}
+
 __attribute__((constructor)) static void A11yInit(void) {
     Class UILabel_ = objc_getClass("UILabel");
     Class UITextField_ = objc_getClass("UITextField");
     InstallTextHook(UILabel_, &gOrigSetText, (IMP)HookSetText, "setText:");
     InstallTextHook(UILabel_, &gOrigSetAttrText, (IMP)HookSetAttrText, "setAttributedText:");
     InstallTextHook(UITextField_, &gOrigTFSetText, (IMP)HookTFSetText, "setText:");
+    Class UITextView_ = objc_getClass("UITextView");
+    InstallTextHook(UITextView_, &gOrigTVSetText, (IMP)HookTVSetText, "setText:");
+    InstallTextHook(UITextView_, &gOrigTVSetAttrText, (IMP)HookTVSetAttrText, "setAttributedText:");
     InstallA11yLabelHook();
 
     Class UIView_ = objc_getClass("UIView");
@@ -1573,14 +1700,14 @@ __attribute__((constructor)) static void A11yInit(void) {
     gFooterReused = NO;
 
     // 加载探针：无论日志开关是否打开，都写一个标记文件并播报一次
-    NSString *boot = [NSString stringWithFormat:@"CallA11y v9 已加载 %@\n", [NSDate date]];
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v10 已加载 %@\n", [NSDate date]];
     [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
             atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载");
     });
-    A11yLog(@"CallA11y v9 载入，日志开关=%d", gLogEnabled);
+    A11yLog(@"CallA11y v10 载入，日志开关=%d", gLogEnabled);
 
     // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:3.0
@@ -1591,6 +1718,7 @@ __attribute__((constructor)) static void A11yInit(void) {
         AttachFloatingEntries();
         AttachBlacklistButton();
         AttachCellActions();
+        SweepSettingsIfNeeded();
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
 }
