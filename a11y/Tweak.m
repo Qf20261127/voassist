@@ -1287,7 +1287,7 @@ static void AddToBlacklistNow(NSString *digits) {
     if (!vc) return;
 
     NSString *digits = nil;
-    id focused = UIAccessibilityFocusedElement(UIAccessibilityScreenChangedNotification);
+    id focused = UIAccessibilityFocusedUIElement(UIAccessibilityScreenChangedNotification);
     if (focused && [focused isKindOfClass:[UIView class]]) digits = LongestDigits(RawA11yLabel((UIView *)focused), 7);
     if (!digits) {
         UITableView *tv = FindFirstTable(vc.view, 0);
