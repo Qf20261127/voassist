@@ -1026,6 +1026,59 @@ static void RefreshBarFor(NSString *typed) {
     });
 }
 
+static char kFloatKey;
+
+static NSUInteger CountSwitches(UIView *root, int depth) {
+    if (!root || depth > 16) return 0;
+    NSUInteger n = [root isKindOfClass:[UISwitch class]] ? 1 : 0;
+    for (UIView *s in root.subviews) n += CountSwitches(s, depth + 1);
+    return n;
+}
+
+// 设置页兜底入口：导航栏挂不上时，直接在设置页右上角放「日志」「黑名单」两个按钮
+static void AttachFloatingEntries(void) {
+    UIWindow *win = KeyWindowNow();
+    if (!win) return;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if ([top isKindOfClass:[UINavigationController class]])
+        top = ((UINavigationController *)top).topViewController;
+    UIView *root = top.view;
+    if (!root) return;
+    if (CountSwitches(root, 0) < 6) return;
+    if (objc_getAssociatedObject(root, &kFloatKey)) return;
+    objc_setAssociatedObject(root, &kFloatKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    CGFloat h = 34, y = 64, x = root.bounds.size.width;
+    UIButton *blk = [UIButton buttonWithType:UIButtonTypeSystem];
+    blk.frame = CGRectMake(x - 78 - 8, y, 78, h);
+    [blk setTitle:@"黑名单" forState:UIControlStateNormal];
+    blk.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    blk.backgroundColor = [UIColor colorWithWhite:1 alpha:0.92];
+    blk.layer.cornerRadius = 8;
+    blk.layer.borderWidth = 0.5;
+    blk.layer.borderColor = [UIColor colorWithWhite:0.7 alpha:1].CGColor;
+    blk.accessibilityLabel = @"黑名单";
+    blk.accessibilityTraits = UIAccessibilityTraitButton;
+    [blk addTarget:[A11yHelper shared] action:@selector(openBlacklist) forControlEvents:UIControlEventTouchUpInside];
+    [root addSubview:blk];
+
+    UIButton *log = [UIButton buttonWithType:UIButtonTypeSystem];
+    log.frame = CGRectMake(x - 78 - 8 - 60 - 6, y, 60, h);
+    [log setTitle:@"日志" forState:UIControlStateNormal];
+    log.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    log.backgroundColor = [UIColor colorWithWhite:1 alpha:0.92];
+    log.layer.cornerRadius = 8;
+    log.layer.borderWidth = 0.5;
+    log.layer.borderColor = [UIColor colorWithWhite:0.7 alpha:1].CGColor;
+    log.accessibilityLabel = @"日志";
+    log.accessibilityTraits = UIAccessibilityTraitButton;
+    [log addTarget:[A11yHelper shared] action:@selector(openLogs) forControlEvents:UIControlEventTouchUpInside];
+    [root addSubview:log];
+
+    A11yLog(@"设置页放上浮动入口（开关数=%lu）", (unsigned long)CountSwitches(root, 0));
+}
+
 static void AttachSettingsEntries(void) {
     UIWindow *win = KeyWindowNow();
     UIViewController *top = win.rootViewController;
@@ -1086,21 +1139,24 @@ __attribute__((constructor)) static void A11yInit(void) {
     LoadLogPref();
     LoadContactsIfNeeded();
     gFooterReused = NO;
-    A11yLog(@"CallA11y v3 载入，日志开关=%d", gLogEnabled);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+    // 加载探针：无论日志开关是否打开，都写一个标记文件并播报一次
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v4 已加载 %@\n", [NSDate date]];
+    [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
+            atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        UIWindow *w = KeyWindowNow();
-        ScanDelete(w);
-        DumpOnce(w);
-        AttachSettingsEntries();
+        UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载");
     });
+    A11yLog(@"CallA11y v4 载入，日志开关=%d", gLogEnabled);
 
-    for (int i = 0; i < 10; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((1.5 + i * 1.5) * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            ScanDelete(KeyWindowNow());
-            AttachSettingsEntries();
-        });
-    }
+    // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                     repeats:YES
+                                                       block:^(NSTimer *t) {
+        ScanDelete(KeyWindowNow());
+        AttachSettingsEntries();
+        AttachFloatingEntries();
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
 }
