@@ -1495,6 +1495,64 @@ static void AttachBlacklistButton(void) {
     A11yLog(@"最近通话页放上加入黑名单按钮（行数=%ld）", (long)rows);
 }
 
+static NSString *CellTexts(UIView *v, int depth) {
+    if (!v || depth > 6) return @"";
+    NSMutableString *s = [NSMutableString string];
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t.length) [s appendFormat:@" %@", t];
+    }
+    NSString *l = RawA11yLabel(v);
+    if (l.length) [s appendFormat:@" %@", l];
+    for (UIView *sub in v.subviews) [s appendString:CellTexts(sub, depth + 1)];
+    return s;
+}
+
+// 旁白转子的「操作」类别读的是 accessibilityCustomActions；
+// App 自己给行挂了「更多」这类动作，说明行是聚焦元素，追加一条就能在转子里看到。
+static void AttachCellActions(void) {
+    UIWindow *win = KeyWindowNow();
+    if (!win) return;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if ([top isKindOfClass:[UINavigationController class]])
+        top = ((UINavigationController *)top).topViewController;
+    UIView *root = top.view;
+    if (!root || !IsRecentCallsPage(root)) return;
+    UITableView *tv = FindFirstTable(root, 0);
+    if (!tv) return;
+
+    for (UITableViewCell *c in [tv visibleCells]) {
+        NSString *d = LongestDigits(RawA11yLabel(c), 7);
+        if (!d) d = LongestDigits(CellTexts(c, 0), 7);
+        if (!d) continue;
+        LoadBlacklist();
+        BOOL inList = (gBlacklist && [gBlacklist containsObject:d]);
+        NSString *title = inList ? @"移出黑名单" : @"加入黑名单";
+
+        UIView *targets[2] = {c, c.contentView};
+        for (int i = 0; i < 2; i++) {
+            UIView *t = targets[i];
+            if (!t) continue;
+            NSArray *old = t.accessibilityCustomActions;
+            BOOL has = NO;
+            for (UIAccessibilityCustomAction *a in old) {
+                if ([a.name rangeOfString:@"黑名单"].location != NSNotFound) { has = YES; break; }
+            }
+            if (has) continue;
+            NSMutableArray *arr = old ? [old mutableCopy] : [NSMutableArray array];
+            A11yAction *a = [[A11yAction alloc] initWithName:title
+                                                     target:[A11yHelper shared]
+                                                   selector:@selector(handleAction:)];
+            a.digits = d;
+            a.kind = inList ? 1 : 0;
+            [arr addObject:a];
+            t.accessibilityCustomActions = arr;
+        }
+        A11yLog(@"通话行挂转子操作 %@（%@）", d, title);
+    }
+}
+
 __attribute__((constructor)) static void A11yInit(void) {
     Class UILabel_ = objc_getClass("UILabel");
     Class UITextField_ = objc_getClass("UITextField");
@@ -1515,14 +1573,14 @@ __attribute__((constructor)) static void A11yInit(void) {
     gFooterReused = NO;
 
     // 加载探针：无论日志开关是否打开，都写一个标记文件并播报一次
-    NSString *boot = [NSString stringWithFormat:@"CallA11y v8 已加载 %@\n", [NSDate date]];
+    NSString *boot = [NSString stringWithFormat:@"CallA11y v9 已加载 %@\n", [NSDate date]];
     [boot writeToFile:[DocDir() stringByAppendingPathComponent:@"a11y_boot.txt"]
             atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"无障碍补丁已加载");
     });
-    A11yLog(@"CallA11y v8 载入，日志开关=%d", gLogEnabled);
+    A11yLog(@"CallA11y v9 载入，日志开关=%d", gLogEnabled);
 
     // 常驻巡检：拨号盘和设置页可能随时才出现，不再只盯前 15 秒
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:3.0
@@ -1532,6 +1590,7 @@ __attribute__((constructor)) static void A11yInit(void) {
         AttachSettingsEntries();
         AttachFloatingEntries();
         AttachBlacklistButton();
+        AttachCellActions();
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
 }
